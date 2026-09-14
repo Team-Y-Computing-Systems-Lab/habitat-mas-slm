@@ -1,0 +1,30 @@
+{
+	"folders": [
+		{
+			"path": "../habitat-sim"
+		},
+		{
+			"path": "../habitat-lab"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"ROS2.distro": "humble",
+		"python-envs.defaultEnvManager": "ms-python.python:conda",
+		"python-envs.defaultPackageManager": "ms-python.python:conda",
+		"python.autoComplete.extraPaths": [
+			"/opt/xilinx/xrt/python",
+			"/opt/xilinx/xrt/python",
+			"/opt/ros/humble/lib/python3.10/site-packages",
+			"/opt/ros/humble/local/lib/python3.10/dist-packages"
+		],
+		"python.analysis.extraPaths": [
+			"/opt/xilinx/xrt/python",
+			"/opt/xilinx/xrt/python",
+			"/opt/ros/humble/lib/python3.10/site-packages",
+			"/opt/ros/humble/local/lib/python3.10/dist-packages"
+		]
+	}
+}
