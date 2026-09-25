@@ -1,0 +1,8 @@
+# Planner side (.venv, Python >= 3.10): MCP servers, SLM client, classical planner, experiment runner.
+# The simulator side lives in the `habitat` conda env (Python 3.9), see README "Setup".
+mcp==2.2.0
+openai>=1.40            # OpenAI-compatible client for Ollama / llama.cpp / vLLM
+anyio>=4
+unified-planning==1.3.0
+up-fast-downward==0.5.2 # Fast Downward engine (prebuilt wheel on x86_64 Linux)
+up-pyperplan==1.1.0     # pure-Python fallback engine (works anywhere, e.g. Jetson)

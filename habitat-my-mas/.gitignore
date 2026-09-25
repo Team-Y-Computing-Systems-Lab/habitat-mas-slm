@@ -1,0 +1,14 @@
+# Data and environments (large or machine-specific; see README "Setup")
+data
+.venv/
+.vscode/
+
+# Experiment outputs: reproducible with the commands in README "Reproducing the experiments"
+results/
+episode_log/
+*.mp4
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
