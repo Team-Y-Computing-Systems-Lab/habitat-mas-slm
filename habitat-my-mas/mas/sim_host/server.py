@@ -54,7 +54,7 @@ def main():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--max-steps", type=int, default=3000,
-                   help="episode step budget; EMOS uses 750, too few for multi-skill plans")
+                   help="episode step budget; 750 (a common rearrangement default) is too few for multi-skill plans")
     p.add_argument("overrides", nargs="*", help="hydra overrides for the habitat config")
     args = p.parse_args()
 

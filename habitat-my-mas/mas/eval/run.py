@@ -1,7 +1,7 @@
 """Run a planner on benchmark episodes and store results + videos.
 
-    conda activate habitat
-    python -m mas.sim_host.server --benchmark replica_manipulation &
+    conda activate habitat-mas
+    python -m mas.sim_host.server --benchmark hssd_fetch_stretch &
     .venv/bin/python -m mas.eval.run --planner slm_only --prompt reach_v2 --normalize --repair --episodes 5
     .venv/bin/python -m mas.eval.run --planner classical_only --episodes 5
     .venv/bin/python -m mas.eval.run --planner slm_classical --model qwen3:4b-instruct --episodes 5

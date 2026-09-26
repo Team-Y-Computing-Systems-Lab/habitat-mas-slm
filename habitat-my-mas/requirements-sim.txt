@@ -1,0 +1,11 @@
+# Simulator side (`habitat-mas` conda env, Python 3.9). Official Habitat only.
+# habitat-sim comes from conda first:
+#   conda create -n habitat-mas python=3.9 cmake=3.14.0 -y
+#   conda install -n habitat-mas habitat-sim=0.3.1 withbullet -c conda-forge -c aihabitat -y
+# then, inside the env:  pip install -r requirements-sim.txt
+habitat-lab @ git+https://github.com/facebookresearch/habitat-lab.git@v0.3.1#subdirectory=habitat-lab
+numpy<1.24               # habitat-sim 0.3.1 needs numpy < 1.24
+opencv-python<4.9        # newer opencv pulls in numpy 2
+pybullet                 # arm IK on the official robot URDFs (mas/sim_host/ik.py)
+imageio
+imageio-ffmpeg           # H.264 episode videos

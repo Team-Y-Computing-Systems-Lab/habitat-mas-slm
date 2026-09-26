@@ -1,4 +1,4 @@
-# Habitat-MAS: SLM + MCP + Classical Planning for Heterogeneous Robot Fleets
+# habitat-my-mas: SLM + MCP + Classical Planning for Heterogeneous Robot Fleets
 
 Working design document. Sections marked **TODO** are open.
 
@@ -56,14 +56,14 @@ resource-constraint scenarios (§7).
                    │   + Recovery Manager         │  failure → recovery ladder
                    └──┬─────────┬─────────┬──────┘
                 MCP   │         │         │   (MCP client, one session per robot)
-             ┌────────▼──┐ ┌────▼─────┐ ┌─▼─────────┐
-             │ Fetch MCP │ │ Spot MCP │ │ Drone MCP │ ...   ← fleet can grow or shrink
-             │ tools:    │ │ tools:   │ │ tools:    │
-             │ nav, pick │ │ nav,pick │ │ fly, look │
-             │ resources:│ │ ...      │ │ ...       │
-             │ resume    │ │          │ │           │
-             └─────┬─────┘ └────┬─────┘ └─────┬─────┘
-                   └────────────┼─────────────┘
+             ┌────────▼──┐ ┌────▼──────┐ ┌─▼─────────┐
+             │ Fetch MCP │ │Stretch MCP│ │ Spot MCP  │ ...   ← fleet can grow or shrink
+             │ tools:    │ │ tools:    │ │ tools:    │
+             │ nav, pick │ │ nav, pick │ │ nav, look │
+             │ resources:│ │ ...       │ │ ...       │
+             │ caps      │ │           │ │           │
+             └─────┬─────┘ └─────┬─────┘ └─────┬─────┘
+                   └─────────────┼─────────────┘
                      ┌──────────▼──────────┐
                      │  Habitat Sim Host   │  one shared habitat-lab env,
                      │  (multi-agent env)  │  steps all robots together

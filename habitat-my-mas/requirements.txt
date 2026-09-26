@@ -1,5 +1,5 @@
 # Planner side (.venv, Python >= 3.10): MCP servers, SLM client, classical planner, experiment runner.
-# The simulator side lives in the `habitat` conda env (Python 3.9), see README "Setup".
+# The simulator side lives in the `habitat-mas` conda env (Python 3.9): requirements-sim.txt.
 mcp==2.2.0
 openai>=1.40            # OpenAI-compatible client for Ollama / llama.cpp / vLLM
 anyio>=4

@@ -87,13 +87,16 @@ Official packages only:
 conda create -n habitat-mas python=3.9 cmake=3.14.0 -y
 conda install -n habitat-mas habitat-sim=0.3.1 withbullet -c conda-forge -c aihabitat -y
 conda activate habitat-mas
-pip install "git+https://github.com/facebookresearch/habitat-lab.git@v0.3.1#subdirectory=habitat-lab"
-pip install pybullet imageio imageio-ffmpeg "numpy<1.24" "opencv-python<4.9"
+pip install -r requirements-sim.txt
 ```
 
-- **habitat-lab source:** 0.3.1 isn't on PyPI, so it's installed from the official GitHub tag.
-- **Pins:** habitat-sim 0.3.1 needs `numpy<1.24`, and opencv 4.9+ would pull in numpy 2.
-- **pybullet:** needed for our arm IK (`mas/sim_host/ik.py`).
+`requirements-sim.txt` installs:
+
+- **habitat-lab 0.3.1 from the official GitHub tag:** that version isn't on PyPI.
+- **Version pins:** `numpy<1.24`, required by habitat-sim 0.3.1, and `opencv-python<4.9`, since
+  newer opencv pulls in numpy 2.
+- **pybullet:** for our arm IK (`mas/sim_host/ik.py`).
+- **imageio + ffmpeg:** for the episode videos.
 
 Check: `python -c "import habitat, habitat_sim; print(habitat.__version__, habitat_sim.__version__)"` prints `0.3.1 0.3.1`.
 
@@ -219,7 +222,7 @@ The feasibility check tries each robot/object pair in simulation, about 20 s per
 | Full matrix: P0 ablations, P1, P2 × models × repeats | `bash scripts/run_experiments.sh` (env vars: `EPISODES=30 REPEATS=3 MAIN_MODEL=… SMALL_MODELS="…"`) | `results/matrix/` |
 
 `run_experiments.sh` starts and stops its own sim host. With the defaults (30 episodes, 3
-repeats, 5 models) it takes a few hours on one GPU. Repeat 1 of every configuration finishes
+repeats, 5 models) it takes about 5–6 hours on one GPU. Repeat 1 of every configuration finishes
 before any repeat 2, so a partial run is still usable. Run
 `.venv/bin/python -m mas.eval.report <dir>` to regenerate the HTML at any time.
 
