@@ -1,7 +1,7 @@
 """Serve a SimHost over HTTP/JSON.
 
-    conda activate habitat
-    python -m mas.sim_host.server --benchmark replica_pool4 --port 8765
+    conda activate habitat-mas
+    python -m mas.sim_host.server --benchmark hssd_fetch_stretch --port 8765
 
 POST /rpc  {"method": "run_skill", "params": {"robot_id": "fetch_0", "skill": "pick", "args": {"object": "bowl_0"}}}
   -> {"result": ...}  or  {"error": {"code": "...", "message": ...}}
@@ -50,7 +50,7 @@ def make_handler(scheduler: Scheduler):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--benchmark", default="replica_pool4")
+    p.add_argument("--benchmark", default="hssd_fetch_stretch")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--max-steps", type=int, default=3000,
@@ -61,8 +61,6 @@ def main():
     os.chdir(PROJECT_ROOT)  # habitat configs use paths relative to data/
     overrides = [
         f"habitat.environment.max_episode_steps={args.max_steps}",
-        # evaluate at the end instead; ending early cuts off the last skill mid-way
-        "habitat.task.end_on_success=False",
     ] + args.overrides
     host = SimHost(args.benchmark, overrides)
     scheduler = Scheduler(host)

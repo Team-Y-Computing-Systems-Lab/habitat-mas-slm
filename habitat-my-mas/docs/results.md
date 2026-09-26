@@ -1,7 +1,7 @@
 # Results format
 
-Each experiment has its own folder (`results/prompt_variants/`, `results/matrix/`, ...) with its
-own `index.html`. Every planner mode writes the same format, so runs can be compared directly:
+Each experiment has its own folder (`results/matrix/`, `results/prompt_variants/`, ...) with its
+own `index.html`. Runs made on EMOS's fork before 2026-09-26 are in `results/emos_fork_era/`. Every planner mode writes the same format, so runs can be compared directly:
 
 - **P0 `slm_only`:** the SLM writes the plan.
 - **P1 `classical_only`:** PDDL goal → classical planner.

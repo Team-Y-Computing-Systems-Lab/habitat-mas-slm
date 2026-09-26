@@ -1,7 +1,7 @@
 #!/bin/bash
 # Experiment matrix: P0 / P1 / P2 planners x models x repeats on one benchmark.
 #
-#   conda env "habitat" must exist; Ollama must be running with the models pulled.
+#   conda env "habitat-mas" must exist; Ollama must be running with the models pulled.
 #   bash scripts/run_experiments.sh                       # defaults below
 #   EPISODES=10 REPEATS=1 MODELS="qwen3:4b-instruct" bash scripts/run_experiments.sh
 #
@@ -11,14 +11,14 @@
 # a half-finished run is started again from scratch.
 set -u
 cd "$(dirname "$0")/.."
-BENCHMARK=${BENCHMARK:-replica_manipulation}
+BENCHMARK=${BENCHMARK:-hssd_fetch_stretch}
 EPISODES=${EPISODES:-30}
 REPEATS=${REPEATS:-3}
 MAIN_MODEL=${MAIN_MODEL:-qwen3:4b-instruct}
 SMALL_MODELS=${SMALL_MODELS:-"qwen3:0.6b llama3.2:3b gemma2:2b smollm2:1.7b"}
 OUT=${OUT:-results/matrix}
 PORT=${PORT:-8765}
-HABITAT_PY=${HABITAT_PY:-$(conda run -n habitat which python 2>/dev/null || echo python)}
+HABITAT_PY=${HABITAT_PY:-$(conda run -n habitat-mas which python 2>/dev/null || echo python)}
 mkdir -p "$OUT/logs"
 
 "$HABITAT_PY" -m mas.sim_host.server --benchmark "$BENCHMARK" --port "$PORT" > "$OUT/logs/sim_host.log" 2>&1 &

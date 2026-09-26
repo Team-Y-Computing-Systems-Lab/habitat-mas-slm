@@ -3,6 +3,68 @@
 Companion to [design.md](design.md) and [results.md](results.md). This is a running log of what we
 learned from experiments, with evidence and likely causes. Newest entries go at the top.
 
+**Note:** entries dated before 2026-09-26 were measured on EMOS's fork of habitat-lab. Their result
+paths now live under `results/emos_fork_era/`.
+
+---
+
+## 2026-09-26 · Standalone on official Habitat (EMOS removed)
+
+**Why:** the project had been running on EMOS's fork of habitat-lab, because the existing
+`habitat` env had it installed, and it also used EMOS's released data. The goal is a standalone
+system that depends only on official Habitat, with EMOS as related work.
+
+**What changed:**
+
+| Before (EMOS fork) | Now (official 0.3.1) |
+|---|---|
+| EMOS benchmark and robot configs | our own config (`mas/sim_host/configs/hssd_fetch_stretch.yaml`) built from official agent, sensor, task and dataset configs |
+| Habitat-MAS episodes and robot line-ups (EMOS release) | official `hab3-episodes` (HSSD, validation split), official task spec `multi_agent_tidy_house`; habitat places the robots |
+| EMOS per-robot navigation | official `OracleNavAction` |
+| EMOS oracle pick/place (IK toward the object, magic grasp) | **our own arm controller**: turn so the arm can reach, move the gripper about 4 cm per step with IK on the robot's **official URDF** (pybullet, `mas/sim_host/ik.py`), then grasp or release with the official grasp manager |
+| EMOS arm-only models for Stretch and Spot | not needed: IK runs on the full official URDF; only Fetch has an official arm-only model |
+| Drone | removed; there's no official drone |
+| Env `habitat` (EMOS clone) | new env `habitat-mas`: habitat-sim 0.3.1 (conda) + habitat-lab v0.3.1 (official GitHub tag) |
+
+**Checks:**
+- **Arm model vs habitat:** after fitting the frame transform once per robot, the IK model and
+  habitat agree on every link position to under 1 mm.
+- **IK solver:** converges to under 1 mm on reachable targets, about 4 ms per solve.
+- **Skills on 4 episodes (first object each):**
+  - Fetch completed 4 of 4 pick-and-places, all confirmed by habitat's own goal check.
+  - Stretch completed 2 of 4. Its two failures are an object at 0.36 m and a goal spot at
+    0.33 m, below its lowest reach of 0.38 m; both fail cleanly as `OUT_OF_REACH`.
+- **Smoke tests:** robot pool and MCP end to end both pass.
+- **Planners:** classical, SLM-only and SLM + classical all run end to end.
+
+**F14. On official robot models the embodiment gap is reversed.**
+- With EMOS's arm models, Stretch couldn't reach *high* shelves (max 1.22 m).
+- From the official URDFs: Fetch reaches 0.05–1.76 m, and Stretch reaches 0.38–1.70 m, so Stretch
+  now fails on *low* objects.
+
+Allocation still matters, but which robot suits which object changed. That's a reminder that
+embodiment findings depend on the robot model used.
+
+**Things we had to build ourselves, and why:**
+
+- **Arm IK:** official `ArmEEAction` drives motors, which do nothing in kinematic mode, and
+  habitat re-applies stored joint values (`fix_joint_values`) every step. Our controller sets both.
+- **Frame fit:** habitat reports link positions at each link's centre of mass, while pybullet's IK
+  works on URDF link frames with the base at its centre of mass. The frame is fitted from all
+  links' centres of mass (exact).
+- **Numerical Jacobian:** pybullet's analytic Jacobian uses another frame convention, so we
+  compute it numerically in habitat's frame.
+- **Turning before a grasp:** Stretch's arm points sideways, so pick/place first turn the base
+  to the heading with the smallest turn from which IK reaches the target.
+- **Getting unstuck:** turning stops when the heading stops improving, since a blocked base
+  jitters in place. The rest pose is clamped to joint limits, because the start pose can sit
+  slightly outside them.
+
+**Consequence:** every earlier number (E1–E5, F1–F13) was measured on the EMOS fork, with different
+controllers, episodes and robot models. Those results are archived in `results/emos_fork_era/` and
+must not be mixed with new runs. The qualitative findings (e.g. P2 ≫ P0 for small models) need to
+be re-established by the new matrix run.
+
 ---
 
 ## 2026-09-24 · Planner matrix: P0 vs P1 vs P2, five models, 3 repeats

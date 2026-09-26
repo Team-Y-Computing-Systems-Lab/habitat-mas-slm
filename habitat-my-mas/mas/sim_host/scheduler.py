@@ -19,7 +19,7 @@ from .skills import SkillFailure, SkillRunner, make_runner
 
 # methods callable directly on the host between sim steps
 HOST_METHODS = {"info", "episodes", "reset", "state", "fleet", "robot",
-                "activate", "deactivate", "step", "skills", "facts", "task_goal", "goal_status", "arm_reach", "check_reach", "feasibility",
+                "activate", "deactivate", "step", "skills", "facts", "task_goal", "goal_status", "arm_reach", "feasibility",
                 "start_recording", "stop_recording"}
 
 

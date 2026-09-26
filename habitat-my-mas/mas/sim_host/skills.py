@@ -6,6 +6,11 @@ problems; it returns a structured result the executor can recover from
 (design.md §6):
 
   {"status": "ok" | "failed", "code": "...", "message": "...", "steps": n}
+
+Navigation uses habitat's official OracleNavAction. Arm skills (pick, place,
+reset_arm) are our own controller: turn the base so the arm can reach, move
+the end effector a few centimetres per step with IK on the robot's official
+URDF (ik.py), then grasp or release with habitat's grasp manager.
 """
 
 from typing import Any, Dict, Optional
@@ -14,13 +19,16 @@ import numpy as np
 
 from mas.skills.catalog import SKILLS
 
-from .host import SimHost, SimHostError
+from .host import IDLE, SimHost, SimHostError
 
-PLACE_THRESH = 0.15   # m, held object to goal location before release
-STALL_EPS = 1e-3      # m, end-effector movement counted as "not moving"
-STALL_STEPS = 25      # consecutive stalled steps before giving up
-NAV_STALL_STEPS = 60  # base not moving this long (after it moved): navigation is over
-NAV_NEAR_M = 1.0      # ...and counts as arrived if this close to the target
+GRASP_DIST = 0.15       # m, end effector to object for a grasp (habitat's magic-grasp distance)
+PLACE_THRESH = 0.15     # m, held object to its goal spot before release
+EE_STEP = 0.04          # m, end-effector motion per step
+ARM_STALL_STEPS = 25    # steps without 3 mm of progress: out of reach
+JOINT_STEP = 0.15       # rad (or m for prismatic joints) per step when returning to rest
+TURN_TOL = np.radians(3)
+NAV_STALL_STEPS = 60    # base not moving this long (after it moved): navigation is over
+NAV_NEAR_M = 1.0        # ...and counts as arrived if this close to the target
 
 
 class SkillFailure(Exception):
@@ -69,41 +77,6 @@ class SkillRunner:
         return result
 
 
-class _ArmReset:
-    """Shared tail of pick/place: move the arm back to rest."""
-
-    def __init__(self):
-        self.prev_joints = None
-        self.still = 0
-
-    def action(self):
-        return {"name": "arm_reset_action", "args": {"arm_reset_action": [1.0]}}
-
-    def done(self, agent) -> bool:
-        joints = np.array(agent.articulated_agent.arm_joint_pos)
-        if self.prev_joints is not None and np.abs(joints - self.prev_joints).max() < 1e-3:
-            self.still += 1
-        else:
-            self.still = 0
-        self.prev_joints = joints
-        return self.still >= 3
-
-
-class _Stall:
-    def __init__(self):
-        self.prev = None
-        self.count = 0
-
-    def update(self, pos) -> bool:
-        pos = np.array(pos)
-        if self.prev is not None and np.linalg.norm(pos - self.prev) < STALL_EPS:
-            self.count += 1
-        else:
-            self.count = 0
-        self.prev = pos
-        return self.count >= STALL_STEPS
-
-
 class NavigateTo(SkillRunner):
     max_steps = 1500
 
@@ -112,14 +85,6 @@ class NavigateTo(SkillRunner):
         self.target = target
         self.entity = host.resolve_nav_target(robot_id, target)
         self._last_pos, self._still, self._moved = None, 0, False
-
-    def immediate_result(self):
-        nav = self.task_action("oracle_nav_action")
-        # the nav action ignores a repeated request for a target it already reached
-        if getattr(nav, "prev_nav_done", False) and getattr(nav, "prev_match_target_id", None) == self.entity:
-            self.host.set_robot_place(self.robot_id, self.target)
-            return self.ok(f"already at {self.target}")
-        return None
 
     def action(self):
         return {"name": "oracle_nav_action", "args": {"oracle_nav_action": [self.entity + 1]}}
@@ -149,56 +114,139 @@ class NavigateTo(SkillRunner):
         return None
 
 
-class Pick(SkillRunner):
-    max_steps = 400
+def _wrap(a: float) -> float:
+    return (a + np.pi) % (2 * np.pi) - np.pi
 
+
+class ArmSkill(SkillRunner):
+    """orient -> reach -> (subclass: grasp/release) -> rest."""
+    max_steps = 500
+
+    def __init__(self, host, robot_id):
+        super().__init__(host, robot_id)
+        self.phase = "orient"
+        self.yaw_goal: Optional[float] = None
+        self.turn_still = 0
+        self.best = np.inf
+        self.stall = 0
+
+    # subclasses
+    def target_world(self) -> np.ndarray:
+        raise NotImplementedError
+
+    def contact(self) -> bool:
+        """At the target: grasp or release. Return True when done."""
+        raise NotImplementedError
+
+    def contact_distance(self) -> float:
+        return float(np.linalg.norm(self.host.ee_world(self.robot_id) - self.target_world()))
+
+    # heading from which the arm reaches the target best, preferring small turns
+    def _choose_heading(self) -> float:
+        art = self.agent.articulated_agent
+        ik = self.host.arm(self.robot_id)
+        yaw0 = float(art.base_rot)
+        scored = []
+        for dyaw in np.radians(np.arange(0, 360, 15)):
+            art.base_rot = yaw0 + dyaw
+            local = self.host.to_local(self.robot_id, self.target_world())
+            q = ik.ik(local, iterations=25)
+            scored.append((float(np.linalg.norm(ik.fk(q) - local)), abs(_wrap(dyaw)), dyaw))
+        art.base_rot = yaw0
+        good = [x for x in scored if x[0] < 0.05]
+        pick = min(good, key=lambda x: x[1]) if good else min(scored)
+        return yaw0 + pick[2]
+
+    def action(self):
+        if self.phase == "orient":
+            if self.yaw_goal is None:
+                self.yaw_goal = self._choose_heading()
+                self._best_err = np.inf
+            err = _wrap(self.yaw_goal - float(self.agent.articulated_agent.base_rot))
+            # stop turning when aligned, or when the heading stops improving
+            # (the base is blocked and jitters in place)
+            if abs(err) > TURN_TOL and self.turn_still < 20 and self.steps < 150:
+                return {"name": "base_velocity", "args": {"base_vel": [0.0, float(np.clip(3 * err, -1, 1))]}}
+            self.phase = "reach"
+        if self.phase == "reach":
+            ik = self.host.arm(self.robot_id)
+            ee = ik.fk()
+            goal = self.host.to_local(self.robot_id, self.target_world())
+            delta = goal - ee
+            n = float(np.linalg.norm(delta))
+            q = ik.ik(ee + delta * min(1.0, EE_STEP / max(n, 1e-6)))
+            self.host.set_arm(self.robot_id, q)
+        elif self.phase == "rest":
+            cur = np.array(self.agent.articulated_agent.arm_joint_pos)
+            self.host.set_arm(self.robot_id, cur + np.clip(self._rest() - cur, -JOINT_STEP, JOINT_STEP))
+        return IDLE
+
+    def _rest(self) -> np.ndarray:
+        # the start pose can sit slightly outside joint limits habitat enforces
+        lo, hi = self.host.arm(self.robot_id).limits()
+        return np.clip(self.host._rest_q[self.robot_id], lo, hi)
+
+    def after_step(self):
+        if self.phase == "orient":
+            err = abs(_wrap(self.yaw_goal - float(self.agent.articulated_agent.base_rot)))
+            if err < self._best_err - np.radians(0.5):
+                self._best_err, self.turn_still = err, 0
+            else:
+                self.turn_still += 1
+            return None
+        if self.phase == "rest":
+            cur = np.array(self.agent.articulated_agent.arm_joint_pos)
+            moved = getattr(self, "_rest_prev", None) is None or np.abs(cur - self._rest_prev).max() > 1e-4
+            self._rest_prev = cur
+            if np.abs(cur - self._rest()).max() < 0.01 or not moved:
+                return self.ok(self.done_message)
+            return None
+        d = self.contact_distance()
+        if self.contact():
+            self.phase = "rest"
+            return None
+        if d < self.best - 0.003:
+            self.best, self.stall = d, 0
+        else:
+            self.stall += 1
+        if self.stall >= ARM_STALL_STEPS:
+            raise SkillFailure("OUT_OF_REACH", f"arm stopped {d:.2f} m from the target")
+        return None
+
+
+class Pick(ArmSkill):
     def __init__(self, host, robot_id, object: str):
         super().__init__(host, robot_id)
         self.object = object
-        self.entity = host.resolve_object(object)
         self.handle = host._names.handle(object)
-        self.stall = _Stall()
-        self.reset = None
+        host.resolve_object(object)  # raises UNKNOWN_OBJECT for a bad name
+        self.done_message = f"holding {object}"
+
+    def _obj(self):
+        return self.host.env.sim.get_rigid_object_manager().get_object_by_handle(self.handle)
 
     def immediate_result(self):
         if self.agent.grasp_mgr.is_grasped:
             raise SkillFailure("HAND_FULL", f"{self.robot_id} is already holding {self.host.robot(self.robot_id)['holding']}")
         return None
 
-    def action(self):
-        if self.reset:
-            return self.reset.action()
-        return {"name": "arm_pick_action",
-                "args": {"arm_pick_action": [self.entity, 1.0], "grip_pick_action": [1.0]}}
+    def target_world(self):
+        return np.array(self._obj().translation)
 
-    def after_step(self):
-        gm = self.agent.grasp_mgr
-        if self.reset:
-            return self.ok(f"holding {self.object}") if self.reset.done(self.agent) else None
-        if gm.is_grasped:
-            held = self.host.env.sim.get_rigid_object_manager().get_object_by_id(gm.snap_idx)
-            if held.handle != self.handle:
-                gm.desnap()
-                raise SkillFailure("WRONG_OBJECT", f"grasped {self.host._names.name(held.handle)} instead")
-            self.host.on_pick(self.robot_id, self.object)
-            self.reset = _ArmReset()
-            return None
-        if self.stall.update(self.agent.articulated_agent.ee_transform().translation):
-            raise SkillFailure("OUT_OF_REACH", f"arm stopped before reaching {self.object}")
-        return None
+    def contact(self) -> bool:
+        if self.contact_distance() >= GRASP_DIST:
+            return False
+        self.agent.grasp_mgr.snap_to_obj(self._obj().object_id)
+        self.host.on_pick(self.robot_id, self.object)
+        return True
 
 
-class Place(SkillRunner):
-    max_steps = 400
-
+class Place(ArmSkill):
     def __init__(self, host, robot_id, object: str, place: str):
         super().__init__(host, robot_id)
         self.object, self.place = object, place
-        self.entity = host.resolve_goal_place(place, object)
-        self.goal_pos = np.array(host.entity_pos(self.entity))
-        self.stall = _Stall()
-        self.releasing = False
-        self.reset = None
+        self.goal = np.array(host.entity_pos(host.resolve_goal_place(place, object)))
+        self.done_message = f"{object} on {place}"
 
     def immediate_result(self):
         held = self.host.robot(self.robot_id)["holding"]
@@ -206,57 +254,38 @@ class Place(SkillRunner):
             raise SkillFailure("NOT_HOLDING", f"{self.robot_id} holds {held}, not {self.object}")
         return None
 
-    def action(self):
-        if self.reset:
-            return self.reset.action()
-        if self.releasing:
-            return {"name": "arm_place_action",
-                    "args": {"arm_place_action": [self.entity, 0.0], "grip_place_action": [-1.0]}}
-        return {"name": "arm_place_action",
-                "args": {"arm_place_action": [self.entity, 2.0], "grip_place_action": [1.0]}}
+    def target_world(self):
+        return self.goal
 
-    def after_step(self):
-        if self.reset:
-            return self.ok(f"{self.object} on {self.place}") if self.reset.done(self.agent) else None
-        if self.releasing:
-            if not self.agent.grasp_mgr.is_grasped:
-                self.host.on_place(self.robot_id, self.object, self.place)
-                self.reset = _ArmReset()
-            return None
-        obj = self.host.env.sim.get_rigid_object_manager().get_object_by_handle(
-            self.host._names.handle(self.object))
-        if np.linalg.norm(np.array(obj.translation) - self.goal_pos) < PLACE_THRESH:
-            self.releasing = True
-            return None
-        if self.stall.update(self.agent.articulated_agent.ee_transform().translation):
-            raise SkillFailure("OUT_OF_REACH", f"arm stopped before reaching {self.place}")
-        return None
+    def contact_distance(self) -> float:
+        obj = self.host.env.sim.get_rigid_object_manager().get_object_by_handle(self.host._names.handle(self.object))
+        return float(np.linalg.norm(np.array(obj.translation) - self.goal))
+
+    def contact(self) -> bool:
+        if self.contact_distance() >= PLACE_THRESH:
+            return False
+        self.agent.grasp_mgr.desnap()
+        self.host.on_place(self.robot_id, self.object, self.place)
+        return True
+
+
+class ResetArm(ArmSkill):
+    def __init__(self, host, robot_id):
+        super().__init__(host, robot_id)
+        self.phase = "rest"
+        self.done_message = "arm at rest"
 
 
 class Look(SkillRunner):
     max_steps = 1
 
     def action(self):
-        return {"name": "wait", "args": {"wait": [1.0]}}
+        return IDLE
 
     def after_step(self):
         seen = self.host.visible_objects(self.robot_id)
         self.host.on_look(self.robot_id)
         return self.ok(f"sees {seen}" if seen else "sees no task objects", visible=seen)
-
-
-class ResetArm(SkillRunner):
-    max_steps = 80
-
-    def __init__(self, host, robot_id):
-        super().__init__(host, robot_id)
-        self.reset = _ArmReset()
-
-    def action(self):
-        return self.reset.action()
-
-    def after_step(self):
-        return self.ok("arm at rest") if self.reset.done(self.agent) else None
 
 
 class Wait(SkillRunner):
@@ -265,7 +294,7 @@ class Wait(SkillRunner):
         self.n = max(1, min(int(steps), 200))
 
     def action(self):
-        return {"name": "wait", "args": {"wait": [1.0]}}
+        return IDLE
 
     def after_step(self):
         return self.ok(f"waited {self.steps} steps") if self.steps >= self.n else None

@@ -1,7 +1,7 @@
 """Smoke test for the sim host robot pool. Needs a running server:
 
-    conda activate habitat
-    python -m mas.sim_host.server --benchmark replica_pool4 &
+    conda activate habitat-mas
+    python -m mas.sim_host.server --benchmark hssd_fetch_stretch &
     python tests/smoke_sim_host.py            # any Python >= 3.8
 """
 
@@ -26,38 +26,34 @@ def main():
     pool = [r["id"] for r in info["pool"]]
     print("pool:", pool, "| episodes:", info["num_episodes"])
     check(len(pool) >= 2, "pool has at least two robots")
+    keep, park = pool[0], pool[1]
 
-    fleet0 = pool[:2]
-    st = c.reset(episode_id=c.episodes()[0], active=fleet0)
+    st = c.reset(episode_id=c.episodes()[0], active=[keep])
     robots = {r["id"]: r for r in st["robots"]}
     print("objects:", [(o["name"], o["start_receptacle"], "->", o["goal_receptacle"]) for o in st["objects"]])
-    check(all(robots[r]["active"] for r in fleet0), f"fleet {fleet0} active after reset")
-    parked = [r for r in pool if r not in fleet0]
-    check(all(not robots[r]["active"] and robots[r]["pos"][1] < PARK_Y + 1 for r in parked),
-          f"{parked} parked below the scene")
+    check(robots[keep]["active"], f"{keep} active after reset")
+    check(not robots[park]["active"] and robots[park]["pos"][1] < PARK_Y + 1, f"{park} parked below the scene")
 
     for _ in range(5):
         out = c.step()
     robots = {r["id"]: r for r in out["robots"]}
-    check(all(robots[r]["pos"][1] < PARK_Y + 1 for r in parked), "parked robots stay parked after 5 steps")
+    check(robots[park]["pos"][1] < PARK_Y + 1, "parked robot stays parked after 5 steps")
 
     try:
-        c.step({parked[0]: {"name": "wait", "args": {"wait": [1.0]}}})
+        c.step({park: {"name": "base_velocity", "args": {"base_vel": [0.0, 0.0]}}})
         check(False, "action on a parked robot is rejected")
     except SimHostError as e:
         check(e.code == "ROBOT_INACTIVE", f"action on a parked robot is rejected ({e.code})")
 
-    # a robot joins and another leaves mid-episode
-    joined = c.activate(parked[0])
-    check(joined["active"] and joined["pos"][1] > PARK_Y + 1, f"{parked[0]} joins at {joined['pos']}")
-    left = c.deactivate(fleet0[1])
-    check(not left["active"] and left["pos"][1] < PARK_Y + 1, f"{fleet0[1]} leaves the fleet")
+    joined = c.activate(park)
+    check(joined["active"] and joined["pos"][1] > PARK_Y + 1, f"{park} joins at {joined['pos']}")
+    left = c.deactivate(keep)
+    check(not left["active"] and left["pos"][1] < PARK_Y + 1, f"{keep} leaves the fleet")
     prev_step = c.state()["step"]
-    out = c.step({parked[0]: {"name": "wait", "args": {"wait": [1.0]}}})
+    out = c.step({park: {"name": "base_velocity", "args": {"base_vel": [0.0, 0.0]}}})
     check(out["step"] == prev_step + 1 and not out["episode_over"], "joined robot can act")
-
-    back = c.activate(fleet0[1])
-    check(back["active"], f"{fleet0[1]} rejoins at its last pose {back['pos']}")
+    back = c.activate(keep)
+    check(back["active"], f"{keep} rejoins at its last pose {back['pos']}")
     print("\nall checks passed")
 
 

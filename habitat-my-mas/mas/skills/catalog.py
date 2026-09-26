@@ -4,7 +4,7 @@ Pure Python (3.8+) with no habitat import, so the sim host (Python 3.9) and the
 MCP servers / planner (Python 3.10+) share one definition.
 
 A robot gets a skill when it has every low-level habitat action the skill
-`requires`. Each skill carries a PDDL action schema written against DOMAIN
+`requires` ("arm" means the robot has an arm our IK controller can drive). Each skill carries a PDDL action schema written against DOMAIN
 below; the planner builds its domain from the skills the current fleet
 advertises (design.md §4b), so a robot without an arm never contributes
 pick/place.
@@ -51,9 +51,8 @@ SKILLS: Dict[str, dict] = {
     for s in [
         _skill(
             "navigate_to",
-            "Drive, walk or fly to a place (receptacle) or to an object. "
-            "Uses the robot's own mobility: a drone flies, a legged robot can "
-            "take stairs, a wheeled robot cannot.",
+            "Drive or walk to a place (receptacle) or to an object, using the "
+            "robot's own base: a legged robot can take stairs, a wheeled one cannot.",
             {"target": "place name (e.g. table_02_0) or object name (e.g. bowl_0)"},
             ["oracle_nav_action"],
             pddl={
@@ -70,7 +69,7 @@ SKILLS: Dict[str, dict] = {
             "an empty gripper, and the object must be inside its arm workspace. "
             "The arm is reset afterwards.",
             {"object": "object name, e.g. bowl_0"},
-            ["oracle_nav_action", "arm_pick_action", "arm_reset_action"],
+            ["oracle_nav_action", "base_velocity", "arm"],
             pddl={
                 "parameters": "(?r - robot ?o - object ?p - location)",
                 "precondition": "(and (robot-at ?r ?p) (obj-at ?o ?p) (hand-empty ?r) (can-pick ?r ?o))",
@@ -85,7 +84,7 @@ SKILLS: Dict[str, dict] = {
             "and the place must be inside its arm workspace. The arm is reset "
             "afterwards.",
             {"object": "the held object's name", "place": "place name, e.g. table_02_0"},
-            ["oracle_nav_action", "arm_place_action", "arm_reset_action"],
+            ["oracle_nav_action", "base_velocity", "arm"],
             pddl={
                 "parameters": "(?r - robot ?o - object ?p - location)",
                 "precondition": "(and (robot-at ?r ?p) (holding ?r ?o) (can-place ?r ?o ?p))",
@@ -98,7 +97,7 @@ SKILLS: Dict[str, dict] = {
             "look",
             "Report which task objects the robot's cameras can currently see.",
             {},
-            ["wait"],
+            ["base_velocity"],
             pddl={
                 "parameters": "(?r - robot ?p - location)",
                 "precondition": "(robot-at ?r ?p)",
@@ -112,14 +111,14 @@ SKILLS: Dict[str, dict] = {
             "Move the arm back to its resting pose. pick and place already do "
             "this, so it is only needed for recovery.",
             {},
-            ["arm_reset_action"],
+            ["base_velocity", "arm"],
             typical_steps=30,
         ),
         _skill(
             "wait",
             "Do nothing for a number of simulation steps.",
             {"steps": "number of steps, 1-200"},
-            ["wait"],
+            ["base_velocity"],
             typical_steps=None,
         ),
     ]

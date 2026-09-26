@@ -4,8 +4,10 @@ A heterogeneous multi-robot system in [Habitat](https://aihabitat.org/). **Small
 (SLMs)** plan the work, each robot's skills are exposed through **MCP servers**, and a
 **classical planner** (PDDL + Fast Downward) makes plans that are sound and executable.
 
-The benchmark is Habitat-MAS from EMOS ([Chen et al., 2024](https://arxiv.org/abs/2410.22662)).
-Our design differs from EMOS: see [docs/design.md](docs/design.md).
+Everything runs on the **official** habitat-sim and habitat-lab (0.3.1) with **official Habitat
+data** only. The tasks are Habitat 3.0's HSSD rearrangement episodes with the official two-object
+task spec. The closest related work is EMOS ([Chen et al., 2024](https://arxiv.org/abs/2410.22662)).
+We don't use its code or data; [docs/design.md](docs/design.md) explains how our design differs.
 
 Three planner modes are compared on the same episodes:
 
@@ -23,19 +25,19 @@ Every run stores per-episode records, an HTML report and a video: top-down map p
 |---|---|
 | Sim host: shared Habitat env, robot pool, join/leave, video | working |
 | MCP server per robot: skills as tools, PDDL schema in each tool's metadata, capabilities as resources | working |
-| Skills: `navigate_to`, `pick`, `place`, `look`, `reset_arm`, `wait` | working (Fetch, Stretch, Spot); the drone navigates only in its own benchmarks |
+| Skills: `navigate_to` (official oracle navigation); `pick`, `place`, `reset_arm` (our own IK arm controller on the official URDFs); `look`, `wait` | working (Fetch, Stretch) |
 | P0 SLM-only, with plan normalization and one check-and-repair round | working |
 | Furniture-aware reach check (simulated trial pick/place per robot and object) | working |
 | P1 classical-only, P2 SLM + classical (unified-planning + Fast Downward) | working |
 | Recovery with replanning, resource-constraint scenarios | designed, not built (design.md §6–7) |
-| MP3D multi-floor benchmarks | need the full Matterport3D download |
+| Spot in the fleet, multi-floor scenes | not set up yet |
 
 Findings so far: [docs/findings.md](docs/findings.md).
 
 ## How it fits together
 
 ```
- .venv (Python 3.12)                                   habitat conda env (Python 3.9)
+ .venv (Python 3.12)                                   habitat-mas conda env (Python 3.9)
 ┌──────────────────────────────────────────────┐      ┌─────────────────────────────┐
 │ mas.eval.run  (experiment runner)            │      │ mas.sim_host.server          │
 │   ├─ planner: slm_only | classical | slm+cl  │ HTTP │   SimHost: habitat-lab env,  │
@@ -55,6 +57,7 @@ such as a Jetson, with `--sim-url`.
 ```
 mas/
   sim_host/     host.py (env, pool, state, feasibility), skills.py (skill runners),
+                ik.py (arm IK on official URDFs), configs/ (our habitat configs),
                 scheduler.py, server.py / client.py (HTTP), recorder.py (video), naming.py
   skills/       catalog.py (skills + PDDL schemas), robots.py (robot traits)
   mcp_servers/  robot_server.py (one MCP server per robot)
@@ -66,42 +69,46 @@ scripts/        run_experiments.sh (full matrix), calibrate_reach.py
 tests/          smoke_sim_host.py, smoke_mcp_robots.py
 docs/           design.md, datasets.md, results.md, findings.md
 results/        experiment outputs (see docs/results.md)
-data -> …       symlink to the Habitat / EMOS data folder
+data -> …       symlink to the official Habitat data folder
 ```
 
 ## Setup
 
 Tested on Ubuntu 22.04, an NVIDIA RTX PRO 6000 (driver 580), conda, Ollama 0.22.
 
-### 1. Simulator environment (`habitat`, Python 3.9)
+Before 2026-09-26 the project ran on EMOS's fork of habitat-lab. Those results are archived in
+`results/emos_fork_era/` and aren't comparable with current runs (docs/findings.md).
 
-We use EMOS's fork of habitat-lab, because it adds the Habitat-MAS robots, actions and configs:
+### 1. Simulator environment (`habitat-mas`, Python 3.9)
 
-```bash
-git clone -b embodied_mas https://github.com/SgtVincent/EMOS.git
-conda create -n habitat python=3.9 cmake=3.14.0 -y
-conda activate habitat
-conda install habitat-sim=0.3.1 withbullet -c conda-forge -c aihabitat -y
-pip install -e EMOS/habitat-lab
-pip install imageio imageio-ffmpeg opencv-python     # video recording
-```
-
-Check: `python -c "import habitat, habitat_sim; print(habitat_sim.__version__)"` prints `0.3.1`.
-
-### 2. Data
-
-This follows [EMOS's data instructions](https://github.com/SgtVincent/EMOS/tree/embodied_mas/habitat-mas#download-data):
+Official packages only:
 
 ```bash
-python -m habitat_sim.utils.datasets_download --data-path /path/to/emos_data \
-  --uids hssd-hab hab3-episodes habitat_humanoids hab_spot_arm ycb hab3_bench_assets rearrange_task_assets
-# plus the Habitat-MAS robot configs and episodes from EMOS's Google Drive link,
-# merged into /path/to/emos_data (robots/, datasets/, robots/robot_configs/)
-ln -s /path/to/emos_data data            # from the repository root
+conda create -n habitat-mas python=3.9 cmake=3.14.0 -y
+conda install -n habitat-mas habitat-sim=0.3.1 withbullet -c conda-forge -c aihabitat -y
+conda activate habitat-mas
+pip install "git+https://github.com/facebookresearch/habitat-lab.git@v0.3.1#subdirectory=habitat-lab"
+pip install pybullet imageio imageio-ffmpeg "numpy<1.24" "opencv-python<4.9"
 ```
 
-MP3D (for the multi-floor tasks) needs the Matterport3D terms of use signed. Only the example
-scene is used here. See [docs/datasets.md](docs/datasets.md) for what is and isn't on disk.
+- **habitat-lab source:** 0.3.1 isn't on PyPI, so it's installed from the official GitHub tag.
+- **Pins:** habitat-sim 0.3.1 needs `numpy<1.24`, and opencv 4.9+ would pull in numpy 2.
+- **pybullet:** needed for our arm IK (`mas/sim_host/ik.py`).
+
+Check: `python -c "import habitat, habitat_sim; print(habitat.__version__, habitat_sim.__version__)"` prints `0.3.1 0.3.1`.
+
+### 2. Data (official Habitat downloads)
+
+```bash
+D=/path/to/habitat_data
+python -m habitat_sim.utils.datasets_download --data-path $D \
+  --uids hssd-hab hab3-episodes hab_fetch hab_stretch hab_spot_arm ycb replica_cad_dataset rearrange_dataset_v1
+ln -s $D data                            # from the repository root
+```
+
+- **HSSD scenes (`hssd-hab`):** about 23 GB; the other downloads total about 2 GB.
+- **Episodes:** we use `hab3-episodes` (HSSD rearrangement, validation split).
+- **Tracked data:** `data` is ignored by git.
 
 ### 3. Planner environment (`.venv`, Python ≥ 3.10)
 
@@ -123,8 +130,8 @@ Any OpenAI-compatible server works (`--slm-url`), e.g. llama.cpp's `llama-server
 ### 5. Check that it all works
 
 ```bash
-conda activate habitat
-python -m mas.sim_host.server --benchmark replica_pool4 &      # 4-robot pool
+conda activate habitat-mas
+python -m mas.sim_host.server &                                 # Fetch + Stretch
 python tests/smoke_sim_host.py                                  # any Python
 .venv/bin/python tests/smoke_mcp_robots.py                      # MCP end to end
 kill %1
@@ -160,12 +167,15 @@ How the planner is set up (`mas/planners/classical.py`):
 Start the simulator once, and leave it running:
 
 ```bash
-conda activate habitat
-python -m mas.sim_host.server --benchmark replica_manipulation      # port 8765
+conda activate habitat-mas
+python -m mas.sim_host.server                      # benchmark hssd_fetch_stretch, port 8765
 ```
 
-Benchmarks (`mas/sim_host/benchmarks.py`): `replica_manipulation`, `replica_perception`,
-`hssd_height_man`, `hssd_dist_man`, `hssd_height_per`, `replica_pool4`.
+Benchmarks (`mas/sim_host/benchmarks.py`, configs in `mas/sim_host/configs/`):
+
+| Name | What it is |
+|---|---|
+| `hssd_fetch_stretch` | Fetch + Stretch on the official HSSD rearrangement episodes (1,200 validation episodes, two objects each; task spec `multi_agent_tidy_house`) |
 
 Then run a planner from the planner environment:
 
@@ -204,8 +214,8 @@ The feasibility check tries each robot/object pair in simulation, about 20 s per
 
 | Experiment | Command | Output |
 |---|---|---|
-| Prompt variants for P0 (findings, 2026-09-23) | `for v in base reach reach_alloc reach_v2 reach_hint; do .venv/bin/python -m mas.eval.run --planner slm_only --prompt $v --episodes 10 --out results/prompt_variants; done` | `results/prompt_variants/` |
-| Reach-check calibration (height vs IK vs trial) | `conda activate habitat && python scripts/calibrate_reach.py --episodes 10` | `results/reach_calibration/` |
+| Prompt variants for P0 | `for v in base reach reach_alloc reach_v2 reach_hint; do .venv/bin/python -m mas.eval.run --planner slm_only --prompt $v --episodes 10 --out results/prompt_variants; done` | `results/prompt_variants/` |
+| Reach calibration (height range vs real attempt) | `conda activate habitat-mas && python scripts/calibrate_reach.py --episodes 10` | `results/reach_calibration/` |
 | Full matrix: P0 ablations, P1, P2 × models × repeats | `bash scripts/run_experiments.sh` (env vars: `EPISODES=30 REPEATS=3 MAIN_MODEL=… SMALL_MODELS="…"`) | `results/matrix/` |
 
 `run_experiments.sh` starts and stops its own sim host. With the defaults (30 episodes, 3
@@ -235,10 +245,9 @@ which small models work: [docs/findings.md](docs/findings.md).
 |---|---|
 | `Address already in use` when starting the sim host | another sim host is running: `pgrep -af mas.sim_host.server`, or use `--port` |
 | Every skill returns `SIM_UNREACHABLE` | the sim host is not running or crashed; check its log |
-| The drone never finishes `navigate_to` in `replica_pool4` | known issue with EMOS's 4-robot config; the drone works in `replica_perception` |
 | `NAV_STUCK` / "approach point blocked" messages | habitat's navigation can spin in place when blocked; our skill ends it after 60 still steps and counts it as arrived when within 1 m |
-| Many `[Error] … navmesh … not found` lines at startup | harmless: ReplicaCAD scenes `sc4_*` that no episode uses |
-| MP3D benchmarks fail to load | only the example MP3D scene is present; see docs/datasets.md |
+| `ImportError: numpy.core.multiarray failed to import` | numpy 2 got installed; `pip install "numpy<1.24" "opencv-python<4.9"` |
+| `OUT_OF_REACH` for Stretch on low objects | expected: Stretch's arm reaches 0.38–1.70 m above the floor (Fetch 0.05–1.76 m) |
 
 ## Documentation
 
@@ -249,7 +258,9 @@ which small models work: [docs/findings.md](docs/findings.md).
 
 ## References
 
-- EMOS / Habitat-MAS: J. Chen et al., *EMOS: Embodiment-aware Heterogeneous Multi-robot Operating
-  System with LLM Agents*, arXiv:2410.22662, 2024. Code: https://github.com/SgtVincent/EMOS
+- Habitat 3.0: X. Puig et al., *Habitat 3.0: A Co-Habitat for Humans, Avatars and Robots*, 2023.
+  Code: https://github.com/facebookresearch/habitat-lab
+- Related work, not used: EMOS / Habitat-MAS, J. Chen et al., *EMOS: Embodiment-aware Heterogeneous
+  Multi-robot Operating System with LLM Agents*, arXiv:2410.22662, 2024.
 - Our previous work: IEEE Xplore document 11476074, and ACM IGSC 2026,
   doi:10.1145/3797248.3815414 (see docs/design.md §2)

@@ -4,7 +4,7 @@
 
 Normally an MCP client (the coordinator) launches this over stdio, one process
 per robot in the fleet. Tools are registered from what the robot can actually
-do in the sim (mas.skills.catalog), so a drone never advertises pick/place.
+do in the sim (mas.skills.catalog), so a robot without an arm never advertises pick/place.
 
 Every tool returns the sim host's structured result:
   {"status": "ok"|"failed", "code": ..., "message": ..., "steps": n, "robot": {...}}

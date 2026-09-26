@@ -1,0 +1,93 @@
+# @package _global_
+# Fetch + Stretch on the official Habitat 3.0 HSSD rearrangement episodes
+# (hab3-episodes, val split) with the official two-object task spec
+# `multi_agent_tidy_house`. Uses only official habitat-lab 0.3.1 configs.
+#
+# Arms and grasping are driven by our own skills (mas/sim_host/skills.py,
+# ik.py): kinematic mode, inverse kinematics on each robot's official URDF.
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/task: task_config_base
+
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.agent_0: rgbd_head_agent
+  - /habitat/simulator/agents@habitat.simulator.agents.agent_0: fetch
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.agent_1: rgbdp_head_rgbd_arm_agent  # stretch.yaml adds a panoptic head camera
+  - /habitat/simulator/agents@habitat.simulator.agents.agent_1: stretch
+
+  - /habitat/dataset/rearrangement: hssd
+
+  - /habitat/task/actions@habitat.task.actions.agent_0_base_velocity: base_velocity
+  - /habitat/task/actions@habitat.task.actions.agent_0_oracle_nav_action: oracle_nav_action
+  - /habitat/task/actions@habitat.task.actions.agent_1_base_velocity: base_velocity
+  - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_action: oracle_nav_action
+
+  - /habitat/task/measurements:
+    - pddl_success
+    - num_steps
+    - did_agents_collide
+    - num_agents_collide
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 3000
+  task:
+    type: RearrangePddlTask-v0
+    reward_measure: num_steps
+    success_measure: pddl_success
+    success_reward: 10.0
+    end_on_success: False
+    min_distance_start_agents: 5.0
+    constraint_violation_ends_episode: False
+    constraint_violation_drops_object: True
+    measurements:
+      pddl_success:
+        must_call_stop: False
+    task_spec_base_path: benchmark/multi_agent/
+    task_spec: pddl/multi_agent_tidy_house
+    pddl_domain_def: fp
+    robot_at_thresh: 3.0
+    actions:
+      agent_0_oracle_nav_action:
+        type: OracleNavAction
+        motion_control: base_velocity
+        spawn_max_dist_to_obj: -1.0   # stand at the closest navigable point
+        allow_dyn_slide: True
+        lin_speed: 10.0
+        ang_speed: 10.0
+      agent_1_oracle_nav_action:
+        type: OracleNavAction
+        motion_control: base_velocity
+        spawn_max_dist_to_obj: -1.0
+        allow_dyn_slide: True
+        lin_speed: 10.0
+        ang_speed: 10.0
+  simulator:
+    type: RearrangeSim-v0
+    seed: 100
+    additional_object_paths:
+      - "data/objects/ycb/configs/"
+    concur_render: True
+    auto_sleep: True
+    agents_order:
+      - agent_0
+      - agent_1
+    kinematic_mode: True
+    step_physics: False
+    ac_freq_ratio: 1
+    habitat_sim_v0:
+      allow_sliding: True
+      enable_physics: True
+    agents:
+      agent_0:
+        sim_sensors:
+          head_rgb_sensor: {height: 256, width: 256}
+          head_depth_sensor: {height: 256, width: 256}
+      agent_1:
+        sim_sensors:
+          head_rgb_sensor: {height: 256, width: 256}
+          head_depth_sensor: {height: 256, width: 256}
+  dataset:
+    split: val
+    data_path: data/datasets/hssd/rearrange/{split}/social_rearrange.json.gz

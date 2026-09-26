@@ -187,11 +187,10 @@ actuation (a proxy per skill). This is also where the IGSC line of work could co
 
 ## 8. Evaluation
 
-- **Environment:** Habitat 3.0 with the Habitat-MAS scenes already in `data/` (HSSD single-floor,
-  MP3D multi-floor). See [datasets.md](datasets.md) for the data inventory, input format and
-  processing pipeline. Only the example MP3D scene is local.
-- **Robots:** Fetch, Spot, Stretch, drone. `hab_fetch` and `dji_drone` are already in the data
-  folder.
+- **Environment:** official habitat-sim / habitat-lab 0.3.1 with official data. The Habitat 3.0 HSSD
+  rearrangement episodes use the official two-object task spec; see [datasets.md](datasets.md).
+  Until 2026-09-26 the project used EMOS's fork and its Habitat-MAS data; those results are archived.
+- **Robots:** Fetch and Stretch (official models); Spot is available but not in a benchmark yet.
 - **Tasks:** navigation, cooperative perception, rearrangement (single- and multi-floor), plus new
   **fleet-change** and **failure-injection** episodes.
 - **Metrics:**

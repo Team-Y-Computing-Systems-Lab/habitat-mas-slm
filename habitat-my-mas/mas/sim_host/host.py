@@ -1,9 +1,14 @@
 """SimHost: owns one habitat-lab Env and manages a pool of robots.
 
+Runs on official habitat-lab / habitat-sim 0.3.1 only. The task, robots and
+navigation come from official configs (mas/sim_host/configs); arm motion and
+grasping are our own skills (skills.py) using IK on each robot's official URDF
+(ik.py).
+
 Fleet changes (design.md §4a): Habitat fixes the set of articulated agents when
 the env is built, so every robot the episode might use is spawned up front.
-Robots outside the fleet are *parked* far below the scene and receive only
-`wait` actions. Activating a robot moves it back onto the navmesh.
+Robots outside the fleet are *parked* far below the scene and stand still.
+Activating a robot moves it back onto the navmesh.
 """
 
 from typing import Any, Dict, List, Optional
@@ -15,8 +20,11 @@ from habitat.config.default import get_config
 
 from mas.skills.catalog import skills_for
 
-from .benchmarks import BENCHMARKS, EXTRA_OVERRIDES, ROBOT_PREFIX
+from .benchmarks import BENCHMARKS, ROBOT_PREFIX
+from .ik import UrdfArmIK
 from .naming import NameTable
+
+IDLE = {"name": "base_velocity", "args": {"base_vel": [0.0, 0.0]}}  # stand still
 
 PARK_Y = -100.0
 PARK_SPACING = 10.0
@@ -52,8 +60,7 @@ class SimHost:
         if benchmark not in BENCHMARKS:
             raise SimHostError("UNKNOWN_BENCHMARK", f"choose from {sorted(BENCHMARKS)}")
         self.benchmark = benchmark
-        overrides = EXTRA_OVERRIDES.get(benchmark, []) + (overrides or [])
-        self.config = get_config(BENCHMARKS[benchmark], overrides)
+        self.config = get_config(BENCHMARKS[benchmark], overrides or [])
         self.env = habitat.Env(config=self.config)
 
         sim_cfg = self.config.habitat.simulator
@@ -78,6 +85,8 @@ class SimHost:
         self._observed: set = set()
         self.labels: Dict[str, str] = {}  # robot -> current skill, shown in videos
         self._recorder = None
+        self._arms: Dict[str, UrdfArmIK] = {}      # built on first use
+        self._rest_q: Dict[str, np.ndarray] = {}   # arm pose after reset
 
     # ------------------------------------------------------------------ episodes
 
@@ -98,6 +107,10 @@ class SimHost:
         self._step_count = 0
         self.labels = {}
         self._index_episode()
+        for r in self.robots:
+            art = self._agent(r["id"]).articulated_agent
+            self._rest_q[r["id"]] = np.array(art.arm_joint_pos)
+            art.fix_joint_values = np.array(art.arm_joint_pos)
 
         active = set(active) if active is not None else set(self._by_id)
         unknown = active - set(self._by_id)
@@ -116,8 +129,7 @@ class SimHost:
         trials) must not inherit them."""
         for name, act in self.env.task.actions.items():
             if name.endswith("oracle_nav_action"):
-                for attr, val in (("_targets", {}), ("prev_nav_done", False),
-                                  ("prev_match_target_id", None), ("skill_done", False), ("ep_id", None)):
+                for attr, val in (("_targets", {}), ("skill_done", False)):
                     if hasattr(act, attr):
                         setattr(act, attr, val)
 
@@ -276,19 +288,32 @@ class SimHost:
     def on_look(self, robot_id: str) -> None:
         self._observed.add(self._robot_place[robot_id])
 
-    def visible_objects(self, robot_id: str) -> List[str]:
-        idx = self._by_id[robot_id]["agent_idx"]
-        detected = self._last_obs.get(f"agent_{idx}_detected_objects")
-        if detected is None:
-            return []
-        start = self.config.habitat.simulator.object_ids_start
+    def visible_objects(self, robot_id: str, max_dist: float = 4.0, half_fov_deg: float = 60.0) -> List[str]:
+        """Task objects in front of the robot and not occluded: a ray from head
+        height must hit the object first."""
+        import habitat_sim
+        import magnum as mn
+        art = self._agent(robot_id).articulated_agent
+        eye = np.array(art.base_pos) + np.array([0.0, 1.0, 0.0])
+        fwd = np.array(art.base_transformation.transform_vector(mn.Vector3(1, 0, 0)))[[0, 2]]
         rom = self.env.sim.get_rigid_object_manager()
-        seen = set()
-        for sem_id in np.asarray(detected).ravel().tolist():
-            obj = rom.get_object_by_id(int(sem_id) - start)
-            if obj is not None:
-                seen.add(obj.handle)
-        return [o["name"] for o in self._objects if o["handle"] in seen]
+        seen = []
+        for o in self._objects:
+            obj = rom.get_object_by_handle(o["handle"])
+            if obj is None:
+                continue
+            d = np.array(obj.translation) - eye
+            dist = float(np.linalg.norm(d))
+            flat = d[[0, 2]]
+            cos = float(np.dot(fwd, flat) / (np.linalg.norm(fwd) * np.linalg.norm(flat) + 1e-9))
+            if dist > max_dist or cos < np.cos(np.radians(half_fov_deg)):
+                continue
+            ray = habitat_sim.geo.Ray(mn.Vector3(*eye), mn.Vector3(*(d / max(dist, 1e-6))))
+            hits = self.env.sim.cast_ray(ray, max_dist).hits
+            first = next((h for h in hits if h.object_id != art.sim_obj.object_id), None)
+            if first is not None and first.object_id == obj.object_id:
+                seen.append(o["name"])
+        return seen
 
     def facts(self) -> List[str]:
         """Current symbolic state as PDDL facts over readable names."""
@@ -314,6 +339,7 @@ class SimHost:
         names = {f"any_targets|{i}": o["name"] for i, o in enumerate(self._objects)}
         names.update({f"TARGET_any_targets|{i}": o["goal"] for i, o in enumerate(self._objects)})
         names.update({f"agent_{r['agent_idx']}": r["id"] for r in self.robots})
+        names.update({f"robot_{r['agent_idx']}": r["id"] for r in self.robots})
         pred_map = {"at": "obj-at", "robot_at": "robot-at", "not_holding": "hand-empty"}
 
         def walk(expr):
@@ -343,32 +369,64 @@ class SimHost:
         return [{"fact": fact, "met": bool(pp.is_expr_true(expr))}
                 for fact, expr in zip(readable, leaves(pp.goal))]
 
+    # ------------------------------------------------------ arm (our controller)
+
+    def arm(self, robot_id: str) -> UrdfArmIK:
+        """IK model of this robot's arm, synced to its current joint state."""
+        art = self._agent(robot_id).articulated_agent
+        ao = art.sim_obj
+        ik = self._arms.get(robot_id)
+        if ik is None:
+            agent_name = self.config.habitat.simulator.agents_order[self._by_id[robot_id]["agent_idx"]]
+            urdf = self.config.habitat.simulator.agents[agent_name].articulated_agent_urdf
+            ik = UrdfArmIK(urdf, [ao.get_link_joint_name(l) for l in art.params.arm_joints],
+                           ao.get_link_name(art.params.ee_links[0]))
+            self._arms[robot_id] = ik
+            fresh = True
+        else:
+            fresh = False
+        ik.set_joints({ao.get_link_joint_name(l): ao.joint_positions[ao.get_link_joint_pos_offset(l)]
+                       for l in ao.get_link_ids() if ao.get_link_num_joint_pos(l) == 1})
+        if fresh:  # the pybullet -> habitat frame is fixed; fit it once
+            tinv = ao.transformation.inverted()
+            ik.calibrate({ao.get_link_name(l): tinv.transform_point(ao.get_link_scene_node(l).absolute_translation)
+                          for l in ao.get_link_ids()})
+        return ik
+
+    def has_arm(self, robot_id: str) -> bool:
+        params = self._agent(robot_id).articulated_agent.params
+        return bool(getattr(params, "arm_joints", None)) and bool(getattr(params, "ee_links", None))
+
+    def set_arm(self, robot_id: str, q) -> None:
+        art = self._agent(robot_id).articulated_agent
+        art.arm_joint_pos = np.asarray(q, dtype=np.float32)
+        art.fix_joint_values = np.asarray(q, dtype=np.float32)  # kinematic mode re-applies these
+
+    def to_local(self, robot_id: str, world) -> np.ndarray:
+        ao = self._agent(robot_id).articulated_agent.sim_obj
+        return np.array(ao.transformation.inverted().transform_point(np.asarray(world, dtype=np.float32)))
+
+    def ee_world(self, robot_id: str) -> np.ndarray:
+        return np.array(self._agent(robot_id).articulated_agent.ee_transform().translation)
+
     def arm_reach(self, robot_id: str) -> Optional[Dict[str, float]]:
         """Heights (m above the floor) the end effector can reach, from forward
-        kinematics over random joint configurations within the joint limits."""
-        rtype = self._by_id[robot_id]["type"]
+        kinematics over random arm configurations within the joint limits."""
         if not hasattr(self, "_reach_cache"):
             self._reach_cache: Dict[str, Optional[Dict[str, float]]] = {}
+        rtype = self._by_id[robot_id]["type"]
         if rtype in self._reach_cache:
             return self._reach_cache[rtype]
-        k = self._by_id[robot_id]["agent_idx"]
-        act = self.env.task.actions.get(f"agent_{k}_arm_pick_action")
-        if act is None:
+        if not self.has_arm(robot_id):
             self._reach_cache[rtype] = None
             return None
-        ik = act.arm_ctrlr._ik_helper
-        if ik is None:  # created on the first episode reset
+        if not getattr(self, "_objects", None):  # no episode loaded yet
             self.reset()
-            ik = act.arm_ctrlr._ik_helper
-        lo, hi = (np.array(v) for v in ik.get_joint_limits())
         art = self._agent(robot_id).articulated_agent
-        T, floor = art.base_transformation, float(np.array(art.base_pos)[1])
-        rng = np.random.default_rng(0)
-        heights = []
-        for _ in range(2000):
-            q = lo + rng.random(len(lo)) * (hi - lo)
-            heights.append(float(T.transform_point(np.array(ik.calc_fk(q), dtype=np.float32))[1]) - floor)
-        ik.set_arm_state(np.array(art.arm_joint_pos))  # leave the IK model as the arm is
+        ik = self.arm(robot_id)
+        world = art.sim_obj.transformation
+        floor = float(np.array(art.base_pos)[1])
+        heights = [float(world.transform_point(pt.astype(np.float32))[1]) - floor for pt in ik.sample_reach(2000)]
         reach = {"min_height_m": round(max(0.0, min(heights)), 2), "max_height_m": round(max(heights), 2)}
         self._reach_cache[rtype] = reach
         return reach
@@ -378,8 +436,8 @@ class SimHost:
         """Furniture-aware reach check by simulation: for every arm robot and
         task object, try navigate+pick (and, if that works, navigate+place on
         the goal) in a trial rollout, then reset the episode. This stands in
-        for a motion planner's feasibility check; the geometric IK check
-        (`check_reach`) proved unreliable here (docs/findings.md).
+        for a motion planner's feasibility check (a geometric IK check proved
+        unreliable, docs/findings.md F8).
 
         Returns {"matrix": {robot: {object: {"pick": code, "place": code|None}}},
                  "sim_steps": steps spent on trials}. The episode is left freshly reset.
@@ -423,76 +481,6 @@ class SimHost:
         self.reset(ep, active=active)
         return {"episode_id": ep, "matrix": matrix, "sim_steps": steps}
 
-    def check_reach(self, robot_id: str, object: str, place: Optional[str] = None,
-                    tol: float = 0.15) -> Dict[str, Any]:
-        """Can this robot's arm get to the object (or, with `place`, to the
-        object's goal spot on that place)? Accounts for the furniture around it.
-
-        The robot is put at the approach pose its own navigation would use,
-        facing the target; inverse kinematics solves for the arm; the result
-        is reachable when the gripper ends within `tol` (the magic-grasp
-        distance) of the target and the arm in that pose does not intersect
-        the scene. Everything is restored afterwards; no sim step is taken.
-        """
-        k = self._by_id[robot_id]["agent_idx"]
-        act = self.env.task.actions.get(f"agent_{k}_arm_pick_action")
-        if act is None:
-            return {"reachable": False, "reason": "NO_ARM"}
-        entity = self.resolve_goal_place(place, object) if place else self.resolve_object(object)
-        target = np.array(self.entity_pos(entity), dtype=np.float32)
-        nav = self.env.task.actions[f"agent_{k}_oracle_nav_action"]
-        ik = act.arm_ctrlr._ik_helper
-        art = self._agent(robot_id).articulated_agent
-        saved = (np.array(art.base_pos), float(art.base_rot), np.array(art.arm_joint_pos))
-        try:
-            approach, _ = nav._get_target_for_idx(entity)
-            art.base_pos = np.array(approach, dtype=np.float32)
-            # face the target: try both yaw conventions, keep the one that points at it
-            rel = target - np.array(art.base_pos)
-            best = None
-            for yaw in (np.arctan2(-rel[2], rel[0]), np.arctan2(rel[2], rel[0])):
-                art.base_rot = float(yaw)
-                fwd = np.array(art.base_transformation.transform_vector(np.array([1.0, 0, 0], np.float32)))
-                cos = float(np.dot(fwd[[0, 2]], rel[[0, 2]])
-                            / (np.linalg.norm(fwd[[0, 2]]) * np.linalg.norm(rel[[0, 2]]) + 1e-9))
-                if best is None or cos > best[0]:
-                    best = (cos, float(yaw))
-            art.base_rot = best[1]
-
-            T = art.base_transformation
-            local = np.array(T.inverted().transform_point(target))
-            lo, hi = (np.array(v) for v in ik.get_joint_limits())
-            q = np.array(saved[2])
-            for _ in range(5):  # restart IK from its own answer; one call may stop short
-                ik.set_arm_state(q)
-                q = np.clip(np.array(ik.calc_ik(local))[: len(lo)], lo, hi)
-            residual = float(np.linalg.norm(np.array(ik.calc_fk(q)) - local))
-
-            # arm-scene intersection in that pose
-            art.arm_joint_pos = q
-            self.env.sim.perform_discrete_collision_detection()
-            robot_sim_id = art.sim_obj.object_id
-            target_handle = self._names.handle(object)
-            rom = self.env.sim.get_rigid_object_manager()
-            target_obj = rom.get_object_by_handle(target_handle) if target_handle else None
-            ignore = {robot_sim_id} | ({target_obj.object_id} if target_obj is not None else set())
-            arm_links = set(art.params.arm_joints) | set(getattr(art.params, "ee_links", []))
-            hits = 0
-            for c in self.env.sim.get_physics_contact_points():
-                for me, other, link in ((c.object_id_a, c.object_id_b, c.link_id_a),
-                                        (c.object_id_b, c.object_id_a, c.link_id_b)):
-                    if me == robot_sim_id and other not in ignore and link in arm_links \
-                            and c.contact_distance < -0.01:
-                        hits += 1
-        finally:
-            art.base_pos, art.base_rot = saved[0], saved[1]
-            art.arm_joint_pos = saved[2]
-            ik.set_arm_state(saved[2])
-        reachable = residual <= tol and hits == 0
-        reason = "OK" if reachable else ("COLLISION" if residual <= tol else "TOO_FAR")
-        return {"reachable": reachable, "reason": reason, "residual_m": round(residual, 3),
-                "arm_contacts": hits, "target_height_m": self._height(target)}
-
     def _height(self, pos) -> float:
         """Height above the floor below `pos`."""
         floor = np.array(self.env.sim.pathfinder.snap_point(np.array(pos, dtype=np.float32)))
@@ -502,6 +490,8 @@ class SimHost:
     def skills(self, robot_id: str) -> List[dict]:
         prefix = f"agent_{self._by_id[robot_id]['agent_idx']}_"
         low = [k[len(prefix):] for k in self.env.action_space.spaces if k.startswith(prefix)]
+        if self.has_arm(robot_id):
+            low.append("arm")  # driven by our own IK controller, not a habitat action
         return skills_for(low)
 
     # -------------------------------------------------------------------- state
@@ -546,7 +536,7 @@ class SimHost:
 
         actions: {robot_id: {"name": "oracle_nav_action", "args": {"oracle_nav_action": [3]}}}
         Action and arg names are given without the "agent_<i>_" prefix.
-        Robots with no action (and all parked robots) wait.
+        Robots with no action (and all parked robots) stand still.
         """
         actions = actions or {}
         names, args = [], {}
@@ -556,26 +546,15 @@ class SimHost:
             if act is not None and not self._active[rid]:
                 raise SimHostError("ROBOT_INACTIVE", f"{rid} is not in the fleet")
             if act is None:
-                act = {"name": "wait", "args": {"wait": [1.0]}}
+                act = IDLE
             full = prefix + act["name"]
             if full not in self.env.action_space.spaces:
                 raise SimHostError("UNKNOWN_ACTION", f"{rid} has no action {act['name']}")
             names.append(full)
-            # EMOS ends the episode when all rearrange_stop args are 1, which is
-            # vacuously true when none are sent, so always send an explicit 0.
-            if prefix + "rearrange_stop" in self.env.action_space.spaces:
-                args[prefix + "rearrange_stop"] = np.array([0.0], dtype=np.float32)
             for k, v in act.get("args", {}).items():
                 args[prefix + k] = np.array(v, dtype=np.float32)
         if self.env.episode_over:
             raise SimHostError("EPISODE_OVER", "call reset first")
-        # habitat takes the observations from the *last* action's return value;
-        # arm pick/place return an ndarray, so they must not come last
-        returns_array = ("arm_pick_action", "arm_place_action")
-        names.sort(key=lambda n: 0 if n.endswith(returns_array) else 1)
-        if names[-1].endswith(returns_array):
-            names.append(names[-1].split("arm_")[0] + "wait")  # no-op, returns None
-            args[names[-1]] = np.array([1.0], dtype=np.float32)
         self._last_obs = self.env.step({"action": tuple(names), "action_args": args})
         self._step_count += 1
         if self._recorder is not None:

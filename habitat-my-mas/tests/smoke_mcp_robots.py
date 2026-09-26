@@ -1,7 +1,7 @@
 """End-to-end MCP test: spawn robot MCP servers over stdio and drive the sim.
 
-    conda activate habitat
-    python -m mas.sim_host.server --benchmark replica_pool4 &
+    conda activate habitat-mas
+    python -m mas.sim_host.server --benchmark hssd_fetch_stretch &
     .venv/bin/python tests/smoke_mcp_robots.py
 """
 
@@ -47,12 +47,12 @@ def result_of(call) -> dict:
 
 async def main():
     sim = SimClient()
-    st = sim.reset(episode_id=sim.episodes()[0], active=["fetch_0", "drone_0"])
+    st = sim.reset(episode_id=sim.episodes()[0], active=["fetch_0", "stretch_0"])
     obj = st["objects"][0]
 
     async with AsyncExitStack() as stack:
         fetch = await connect(stack, "fetch_0")
-        drone = await connect(stack, "drone_0")
+        stretch = await connect(stack, "stretch_0")
 
         tools = {t.name: t for t in (await fetch.list_tools()).tools}
         print("fetch tools:", sorted(tools))
@@ -61,21 +61,18 @@ async def main():
               "tool meta carries the PDDL schema")
         print("  pick schema:", json.dumps(tools["pick"].input_schema["properties"]))
 
-        drone_tools = {t.name for t in (await drone.list_tools()).tools}
-        print("drone tools:", sorted(drone_tools))
-        check("pick" not in drone_tools, "drone does not advertise pick (no arm)")
-
-        caps = await drone.read_resource("robot://drone_0/capabilities")
+        caps = await stretch.read_resource("robot://stretch_0/capabilities")
         caps = json.loads(caps.contents[0].text)
-        print("drone capabilities:", caps)
-        check(caps["mobility"] == "flying", "capability resource reports mobility")
+        print("stretch capabilities:", caps)
+        check(caps["mobility"] == "wheeled" and caps["arm_reach"]["max_height_m"] > 1.0,
+              "capability resource reports mobility and arm reach")
 
         async def call(session, tool, **args):
             r = result_of(await session.call_tool(tool, args))
             print(f"  {tool}({args}) -> {r['status']} {r['code']} steps={r['steps']} {r['message']}", flush=True)
             return r
 
-        # fetch pick-and-place through MCP while the drone looks in parallel
+        # fetch pick-and-place through MCP while stretch looks in parallel
         async def fetch_job():
             ok = [(await call(fetch, "navigate_to", target=obj["name"]))["status"],
                   (await call(fetch, "pick", object=obj["name"]))["status"],
@@ -83,9 +80,9 @@ async def main():
                   (await call(fetch, "place", object=obj["name"], place=obj["goal_receptacle"]))["status"]]
             return ok
 
-        fetch_ok, look = await asyncio.gather(fetch_job(), call(drone, "look"))
+        fetch_ok, look = await asyncio.gather(fetch_job(), call(stretch, "look"))
         check(all(s == "ok" for s in fetch_ok), f"fetch moved {obj['name']} to {obj['goal_receptacle']} via MCP")
-        check(look["status"] == "ok", "drone look ran in parallel")
+        check(look["status"] == "ok", "stretch look ran in parallel")
 
         bad = await call(fetch, "place", object=obj["name"], place=obj["goal_receptacle"])
         check(bad["status"] == "failed" and bad["code"] == "NOT_HOLDING",
