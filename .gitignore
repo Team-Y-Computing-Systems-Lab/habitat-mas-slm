@@ -1,0 +1,16 @@
+# This repository tracks only habitat-my-mas/; the other folders here
+# (habitat-lab, habitat-sim, ai2thor projects, data, videos) stay untracked.
+/*
+!/.gitignore
+!/habitat-my-mas/
+
+# hidden files and folders (except .gitignore files)
+.*
+!.gitignore
+
+# python/cache output
+__pycache__/
+*.py[cod]
+
+# optional navigation frame captures
+frames/
