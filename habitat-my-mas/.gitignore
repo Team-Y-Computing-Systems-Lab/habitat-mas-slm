@@ -5,6 +5,7 @@ data
 
 # Experiment outputs: reproducible with the commands in README "Reproducing the experiments"
 results/
+results 
 episode_log/
 *.mp4
 *.log
