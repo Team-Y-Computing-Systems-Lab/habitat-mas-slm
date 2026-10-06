@@ -20,6 +20,7 @@ Layout (one directory per run, same format for every planner mode):
 
 import argparse
 import asyncio
+import copy
 import csv
 import json
 import os
@@ -162,6 +163,7 @@ def summarize(records: List[dict]) -> dict:
         "avg_execution_wall_s": round(sum(r["execution_wall_s"] for r in records) / n, 2),
         "repaired_rate": round(sum(bool(r["metrics"].get("repaired")) for r in records) / n, 3),
         "avg_plan_rewrites": round(sum(r["metrics"].get("plan_rewrites", 0) for r in records) / n, 2),
+        "avg_replans": round(sum(r["metrics"].get("replans", 0) for r in records) / n, 2),
         "failure_codes": codes,
     }
 
@@ -170,17 +172,20 @@ def summarize(records: List[dict]) -> dict:
 
 def make_planner(args):
     if args.planner == "slm_only":
-        return SLMOnlyPlanner(SLMClient(args.model, base_url=args.slm_url), prompt=args.prompt)
+        return SLMOnlyPlanner(SLMClient(args.model, base_url=args.slm_url, max_tokens=args.max_tokens),
+                              prompt=args.prompt)
     if args.planner == "classical_only":
         return ClassicalOnlyPlanner(engine=args.engine)
-    return SLMClassicalPlanner(SLMClient(args.model, base_url=args.slm_url), engine=args.engine)
+    return SLMClassicalPlanner(SLMClient(args.model, base_url=args.slm_url, max_tokens=args.max_tokens),
+                               engine=args.engine)
 
 
 def run_tag(args) -> str:
     """Short name of the configuration, used in run ids and the index."""
+    extra = [f"replan{args.replan}"] if args.replan else []
     if args.planner == "slm_only":
-        return "+".join([args.prompt] + (["norm"] if args.normalize else []) + (["repair"] if args.repair else []))
-    return args.engine
+        return "+".join([args.prompt] + (["norm"] if args.normalize else []) + (["repair"] if args.repair else []) + extra)
+    return "+".join([args.engine] + extra)
 
 
 def feasibility(sim: SimClient, benchmark: str, ep: str, robot_ids: List[str], cache_dir: str) -> dict:
@@ -226,7 +231,8 @@ async def main_async(args):
               "engine": args.engine if args.planner != "slm_only" else None,
               "model": args.model if uses_slm else None, "slm_url": args.slm_url if uses_slm else None,
               "repeat": args.repeat, "episodes": episodes, "fleet": robot_ids,
-              "instruction_level": "explicit", "recovery": "none", "feasibility_check": needs_feas,
+              "instruction_level": "explicit",
+              "recovery": f"replan x{args.replan}" if args.replan else "none", "feasibility_check": needs_feas,
               "video": not args.no_video, "started": datetime.now().isoformat(timespec="seconds")}
     json.dump(config, open(os.path.join(run_dir, "config.json"), "w"), indent=2)
     print(f"[run] {run_id} -> {run_dir}")
@@ -279,17 +285,58 @@ async def main_async(args):
             if record_video:
                 sim.start_recording(os.path.join(ep_dir, "video.mp4"), every=args.video_every)
             t0 = time.time()
-            try:
-                trace = await execute(plan, sessions, t0)
-            except asyncio.TimeoutError:
-                trace = [{"robot": "*", "status": "failed", "code": "EPISODE_WALL_LIMIT", "sim_steps": 0}]
+            trace, rounds, replans = [], 0, []
+            feas_m = copy.deepcopy(ctx["feasibility"]) if ctx["feasibility"] else None
+            slm_goal = next((c["slm_goal"] for c in plan.planner_calls if c.get("slm_goal")), None)
+            cur = plan
+            while True:
+                try:
+                    tr = await execute(cur, sessions, t0)
+                except asyncio.TimeoutError:
+                    tr = [{"robot": "*", "status": "failed", "code": "EPISODE_WALL_LIMIT", "sim_steps": 0}]
+                trace += [{**t, "round": rounds} for t in tr]
+                failures = [t for t in tr if t.get("status") != "ok" and t.get("robot") != "*"]
+                if rounds >= args.replan or not failures:
+                    break
+                now = sim.state()
+                if all(g["met"] for g in now["goal_status"]):
+                    break
+                if feas_m is not None:  # the next plan must not repeat what just failed
+                    for f in failures:
+                        row = feas_m.get(f["robot"], {}).get((f.get("args") or {}).get("object"))
+                        if row is not None and f["skill"] in ("pick", "place"):
+                            row[f["skill"]] = f["code"]
+                rounds += 1
+                try:
+                    if args.planner == "slm_only":
+                        cur = planner.replan(failures, instruction, robots, now)
+                        if args.normalize and cur.parse_ok:
+                            normalize(cur, object_names)
+                    elif args.planner == "classical_only":
+                        cur = planner.plan_for_goal(goal, robots, now, feas_m)
+                    elif slm_goal:  # P2 keeps the SLM's own goal, never the ground truth
+                        cur = planner.plan_for_goal(slm_goal, robots, now, feas_m)
+                    else:
+                        break
+                except Exception as e:
+                    cur = Plan(parse_ok=False, errors=[f"replan error: {e!r}"[:300]])
+                replans.append({**cur.to_dict(), "round": rounds, "failures": failures})
+                print(f"  replan {rounds}: {cur.num_steps()} steps" + (f" errors={cur.errors}" if cur.errors else ""),
+                      flush=True)
+                if not cur.parse_ok or not cur.steps:
+                    break
             wall = round(time.time() - t0, 2)
+            if replans:
+                json.dump(replans, open(os.path.join(ep_dir, "replans.json"), "w"), indent=2)
+                for r in replans:
+                    plan.planner_calls.extend(r.get("planner_calls", []))
             if record_video:
                 video = sim.stop_recording()
             final = sim.state()
 
             metrics = score(goal, final, plan, trace)
             metrics.update(
+                replans=rounds,
                 plan_rewrites=len(pipeline["rewrites"]),
                 repaired=pipeline["repaired"],
                 check_problems_before=len(pipeline["check_before"] or []),
@@ -332,6 +379,9 @@ def main():
                    help="slm_only: rewrite navigate_to(place)+pick(obj) into navigate_to(obj)")
     p.add_argument("--repair", action="store_true",
                    help="slm_only: check the plan (incl. simulated reach) and give the SLM one repair round")
+    p.add_argument("--replan", type=int, default=0,
+                   help="after a failed step, plan again from the current state, up to N times")
+    p.add_argument("--max-tokens", type=int, default=4096, help="SLM output budget per call")
     p.add_argument("--engine", default="fast-downward-opt", choices=["fast-downward", "fast-downward-opt", "pyperplan"],
                    help="classical planning engine (unified-planning)")
     p.add_argument("--slm-url", default=DEFAULT_URL)

@@ -108,17 +108,31 @@ def describe_robots(robots: List[dict], with_reach: bool = False) -> str:
 def describe_tasks(state: dict, robots: List[dict], hint: bool) -> str:
     """One line per object: where it is now, where it goes, heights (reach_v2 / reach_hint)."""
     lines = []
+    done = {g["fact"] for g in state.get("goal_status", []) if g["met"]}
+    held = {r["holding"]: r["id"] for r in state["robots"] if r.get("holding")}
     for o in state["objects"]:
-        line = (f"- {o['name']}: now on {state_place(state, o['name'])} at height {o['height_m']:.2f} m"
-                f" -> goes to {o['goal_receptacle']} (goal spot height {o['goal_height_m']:.2f} m)")
+        if f"(obj-at {o['name']} {o['goal_receptacle']})" in done:
+            lines.append(f"- {o['name']}: already on {o['goal_receptacle']} (done, leave it)")
+            continue
+        where = f"held by {held[o['name']]}" if o["name"] in held else \
+            f"now on {state_place(state, o['name'])} at height {o['height_m']:.2f} m"
+        line = f"- {o['name']}: {where} -> goes to {o['goal_receptacle']} (goal spot height {o['goal_height_m']:.2f} m)"
         if hint:
             who = can_handle(robots, o)
             line += f"; can be handled by: {', '.join(who) if who else 'no robot'}"
         lines.append(line)
-    robots_txt = [f"- {r['id']} is at its start position, holding {r['holding'] or 'nothing'}"
+    robots_txt = [f"- {r['id']} is at {robot_place(state, r['id'])}, holding {r['holding'] or 'nothing'}"
                   for r in state["robots"] if r["active"]]
     return ("Objects (heights above the floor):\n" + "\n".join(lines)
             + "\n\nRobots:\n" + "\n".join(robots_txt))
+
+
+def robot_place(state: dict, rid: str) -> str:
+    for f in state["facts"]:
+        parts = f.strip("()").split()
+        if parts[0] == "robot-at" and parts[1] == rid:
+            return "its start position" if parts[2].startswith("start_") else parts[2]
+    return "its start position"
 
 
 def state_place(state: dict, obj: str) -> str:
@@ -189,6 +203,16 @@ class SLMOnlyPlanner:
 
     def plan(self, instruction: str, robots: List[dict], state: dict, ctx: dict = None) -> Plan:
         return self._ask(self._user(instruction, robots, state), robots, Plan())
+
+    def replan(self, failures: List[dict], instruction: str, robots: List[dict], state: dict) -> Plan:
+        """New plan from the current state after execution failures."""
+        failed = "\n".join(f"- {f['robot']} {f['skill']}({', '.join(map(str, (f.get('args') or {}).values()))}) "
+                           f"failed: {f.get('code')} ({f.get('message', '')})" for f in failures)
+        user = (self._user(instruction, robots, state)
+                + f"\n\nThe previous plan was partly executed. These steps failed:\n{failed}\n\n"
+                + "Write a new plan for what is not done yet, from the robots' current positions. "
+                  "Do not give an object to a robot that already failed to pick or place it.")
+        return self._ask(user, robots, Plan())
 
     def repair(self, plan: Plan, problems: List[str], instruction: str,
                robots: List[dict], state: dict) -> Plan:

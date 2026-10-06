@@ -15,6 +15,12 @@ from openai import OpenAI
 
 DEFAULT_URL = "http://localhost:11434/v1"
 
+# Extra request options per model family. gpt-oss spends its whole output budget
+# on hidden reasoning at the default effort and returns an empty answer.
+MODEL_OPTIONS = {
+    "gpt-oss": {"reasoning_effort": "medium"},
+}
+
 
 @dataclass
 class SLMCall:
@@ -30,7 +36,7 @@ class SLMCall:
 
 class SLMClient:
     def __init__(self, model: str, base_url: str = DEFAULT_URL, temperature: float = 0.0,
-                 max_tokens: int = 2048, timeout: float = 600.0):
+                 max_tokens: int = 4096, timeout: float = 900.0):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -45,6 +51,7 @@ class SLMClient:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             response_format={"type": "json_object"} if json_mode else None,
+            **next((v for k, v in MODEL_OPTIONS.items() if self.model.startswith(k)), {}),
         )
         call = SLMCall(
             model=self.model,
