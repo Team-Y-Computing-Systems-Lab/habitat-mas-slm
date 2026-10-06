@@ -8,6 +8,67 @@ paths now live under `results/emos_fork_era/`.
 
 ---
 
+## 2026-09-29 · E6: planner matrix on official Habitat
+
+**Setup:** `hssd_fetch_stretch` (official HSSD rearrangement episodes, the first 30 of the
+validation split), Fetch + Stretch, 3 repeats. The configurations are the same as E5. Results are
+in `results/matrix/` (`summary.md`, `index.html`).
+
+| Planner | Model | Success | Sub-goals | Tokens in / out | Plan time |
+|---|---|---|---|---|---|
+| P1 classical only | none | 63% | 89% | 0 | 0.5 s |
+| **P2 SLM + classical** | **qwen3:4b-instruct** | **64%** | 89% | 175 / 45 | 0.9 s |
+| **P2 SLM + classical** | **gemma2:2b** | **60%** | 87% | 183 / 51 | 2.2 s |
+| P2 SLM + classical | llama3.2:3b | 53% | 84% | 186 / 45 | 1.4 s |
+| P2 SLM + classical | qwen3:0.6b | 53% | 85% | 550 / 44 | 1.8 s |
+| P2 SLM + classical | smollm2:1.7b | 19% | 66% | 187 / 28 | 0.6 s |
+| P0 SLM only, `reach_v2` | qwen3:4b-instruct | 40% | 76% | 1081 / 1000 | 4.4 s |
+| P0 + rewrite | qwen3:4b-instruct | 40% | 76% | 1081 / 1004 | 4.3 s |
+| P0 + rewrite + repair | qwen3:4b-instruct | 47% | 77% | 1799 / 1601 | 6.9 s |
+| P0 + rewrite + repair | gemma2:2b | 19% | 61% | 2371 / 394 | 12.3 s |
+| P0 + rewrite + repair | llama3.2:3b | 0% | 41% | 2360 / 446 | 8.0 s |
+| P0 + rewrite + repair | qwen3:0.6b | 0% | 50% | 3460 / 453 | 4.4 s |
+| P0 + rewrite + repair | smollm2:1.7b | 0% | 20% | 2651 / 368 | 3.6 s |
+
+These are means over 3 repeats; the spread is at most 7 points.
+
+**F15. The E5 conclusion holds on the standalone setup, at a lower ceiling.**
+- P2 with qwen3:4b (64%) or gemma2:2b (60%) matches classical-only (63%).
+- About 73% is the ceiling: in 8 of 30 episodes the simulated trials show that neither robot can
+  move one of the objects. On EMOS's benchmark that was 3 of 30.
+- *Why lower:* the official episodes weren't built around these two robots' reach.
+
+**F16. Goal translation (P2, exact goal) by model:**
+- qwen3:4b: 30/30
+- gemma2:2b: 97%
+- llama3.2:3b: 90%
+- qwen3:0.6b: 77%
+- smollm2:1.7b: 0%, because it lists only the first object
+
+**F17. Repair helps the 4B model and fails for small models.**
+
+| Model | Needed repair | Fixed by repair | Made worse | Unparseable after repair |
+|---|---|---|---|---|
+| qwen3:4b | 48/90 | 12 | 3 | 6 |
+| gemma2:2b | 78/90 | 6 | 18 | 0 |
+| llama3.2:3b | 90/90 | 0 | 27 | 0 |
+| qwen3:0.6b | 90/90 | 0 | 9 | 6 |
+| smollm2:1.7b | 90/90 | 0 | 6 | 18 |
+
+- **qwen3:4b** went from 40% to 47%. On the same episodes and repeats, repair gained 8 episodes and
+  lost 2.
+- **Small models** rarely fix the flagged problem and often make the plan worse, and repair
+  doubles the tokens.
+- *Open:* small models were run only with repair, so their low P0 scores mix "small model" with
+  "repair". gemma2's plans that passed the checker without repair succeeded 11/12 times, which
+  suggests repair may hurt them. A small ablation (small models, `reach_v2`, no repair) is needed
+  to tell.
+
+**F18. The navigation rewrite changed nothing here** (40% vs 40%). The SLM's plans rarely send
+two robots to the same receptacle.
+
+---
+
 ## 2026-09-26 · Standalone on official Habitat (EMOS removed)
 
 **Why:** the project had been running on EMOS's fork of habitat-lab, because the existing
