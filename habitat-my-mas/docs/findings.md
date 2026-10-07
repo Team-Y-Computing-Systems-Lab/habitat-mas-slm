@@ -8,6 +8,34 @@ paths now live under `results/emos_fork_era/`.
 
 ---
 
+## 2026-10-07 · Why success stays below 73%, and a reach-aware pick/place
+
+**Gap 1: 63% achieved vs 73% possible (E6 classical-only).** In 3 episodes the trial run said
+every object was movable, yet the real run failed with `OUT_OF_REACH`. Habitat chooses the robot's
+stopping point near an object at random, so the trial and the real run stop in different spots.
+Replanning (E7) targets this.
+
+**Gap 2: the 73% ceiling (8 of 30 episodes no robot can complete).**
+
+| Cause | Episodes |
+|---|---|
+| Object at floor level, or goal spot above reach (2.16 m) | 5 |
+| Object 1.05–1.44 m from the nearest floor a robot can stand on (Fetch's arm reaches about 1 m) | 3 |
+
+**F19. The ceiling is set by the robots and the scenes, not by the planner.**
+- **New pick/place:** before reaching, the skill uses the IK model to choose a base pose from
+  which the arm reaches the target: the current spot at any heading, otherwise floor positions
+  0.45–0.9 m around it. Official coordinate navigation drives there, with up to 3 attempts.
+- **Effect on E6's 30 episodes:** 8 robot–object pairs became feasible and 1 was lost, mostly in
+  Stretch's favour since its arm points sideways. No new *episode* became completable: in each of
+  those 8 cases the other robot could already do it. The gain is more allocation options, not a
+  higher ceiling.
+
+**Also fixed:** heights are now measured from the floor the robots stand on. Snapping to the
+nearest navigable surface sometimes picked a raised area and gave negative heights.
+
+---
+
 ## 2026-09-29 · E6: planner matrix on official Habitat
 
 **Setup:** `hssd_fetch_stretch` (official HSSD rearrangement episodes, the first 30 of the
