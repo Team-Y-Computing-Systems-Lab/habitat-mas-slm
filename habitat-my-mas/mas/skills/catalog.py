@@ -69,7 +69,7 @@ SKILLS: Dict[str, dict] = {
             "an empty gripper, and the object must be inside its arm workspace. "
             "The arm is reset afterwards.",
             {"object": "object name, e.g. bowl_0"},
-            ["oracle_nav_action", "base_velocity", "arm"],
+            ["oracle_nav_action", "oracle_nav_coord_action", "base_velocity", "arm"],
             pddl={
                 "parameters": "(?r - robot ?o - object ?p - location)",
                 "precondition": "(and (robot-at ?r ?p) (obj-at ?o ?p) (hand-empty ?r) (can-pick ?r ?o))",
@@ -84,7 +84,7 @@ SKILLS: Dict[str, dict] = {
             "and the place must be inside its arm workspace. The arm is reset "
             "afterwards.",
             {"object": "the held object's name", "place": "place name, e.g. table_02_0"},
-            ["oracle_nav_action", "base_velocity", "arm"],
+            ["oracle_nav_action", "oracle_nav_coord_action", "base_velocity", "arm"],
             pddl={
                 "parameters": "(?r - robot ?o - object ?p - location)",
                 "precondition": "(and (robot-at ?r ?p) (holding ?r ?o) (can-place ?r ?o ?p))",

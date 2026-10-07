@@ -111,6 +111,9 @@ class SimHost:
             art = self._agent(r["id"]).articulated_agent
             self._rest_q[r["id"]] = np.array(art.arm_joint_pos)
             art.fix_joint_values = np.array(art.arm_joint_pos)
+        # the floor the robots stand on (single-floor scenes); heights are measured from it
+        self._floor_y = float(np.median([np.array(self._agent(r["id"]).articulated_agent.base_pos)[1]
+                                         for r in self.robots]))
 
         active = set(active) if active is not None else set(self._by_id)
         unknown = active - set(self._by_id)
@@ -482,10 +485,9 @@ class SimHost:
         return {"episode_id": ep, "matrix": matrix, "sim_steps": steps}
 
     def _height(self, pos) -> float:
-        """Height above the floor below `pos`."""
-        floor = np.array(self.env.sim.pathfinder.snap_point(np.array(pos, dtype=np.float32)))
-        base = floor[1] if not np.isnan(floor).any() else 0.0
-        return round(float(pos[1]) - float(base), 2)
+        """Height above the floor the robots stand on. (Snapping to the nearest
+        walkable surface picked raised areas and gave negative heights.)"""
+        return round(float(pos[1]) - getattr(self, "_floor_y", 0.0), 2)
 
     def skills(self, robot_id: str) -> List[dict]:
         prefix = f"agent_{self._by_id[robot_id]['agent_idx']}_"
