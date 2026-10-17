@@ -170,6 +170,23 @@ def summarize(records: List[dict]) -> dict:
 
 # ------------------------------------------------------------------------ run
 
+def anonymize(names: List[str], seed: str) -> Dict[str, str]:
+    """Readable object/place names -> meaningless pseudo-words (E8), so the SLM cannot lean on
+    household common sense ("a bowl goes in the kitchen")."""
+    import random
+    rng = random.Random(seed)
+    cons, vows = "bdfgklmnprstvz", "aeiou"
+    out, used = {}, set()
+    for n in names:
+        while True:
+            w = "".join(rng.choice(cons) + rng.choice(vows) for _ in range(3))
+            if w not in used:
+                break
+        used.add(w)
+        out[n] = w
+    return out
+
+
 def make_planner(args):
     if args.planner == "slm_only":
         return SLMOnlyPlanner(SLMClient(args.model, base_url=args.slm_url, max_tokens=args.max_tokens),
@@ -182,7 +199,7 @@ def make_planner(args):
 
 def run_tag(args) -> str:
     """Short name of the configuration, used in run ids and the index."""
-    extra = [f"replan{args.replan}"] if args.replan else []
+    extra = ([f"replan{args.replan}"] if args.replan else []) + (["anon"] if args.anonymize else [])
     if args.planner == "slm_only":
         return "+".join([args.prompt] + (["norm"] if args.normalize else []) + (["repair"] if args.repair else []) + extra)
     return "+".join([args.engine] + extra)
@@ -231,7 +248,7 @@ async def main_async(args):
               "engine": args.engine if args.planner != "slm_only" else None,
               "model": args.model if uses_slm else None, "slm_url": args.slm_url if uses_slm else None,
               "repeat": args.repeat, "episodes": episodes, "fleet": robot_ids,
-              "instruction_level": "explicit",
+              "instruction_level": "explicit", "anonymize": args.anonymize,
               "recovery": f"replan x{args.replan}" if args.replan else "none", "feasibility_check": needs_feas,
               "video": not args.no_video, "started": datetime.now().isoformat(timespec="seconds")}
     json.dump(config, open(os.path.join(run_dir, "config.json"), "w"), indent=2)
@@ -254,12 +271,15 @@ async def main_async(args):
             instruction = explicit(goal)
             print(f"\n[ep {ep}] {instruction}", flush=True)
             ctx = {"goal": goal, "feasibility": feas["matrix"] if feas else None}
+            if args.anonymize and uses_slm:
+                planner.slm.rename = anonymize(object_names + state.get("places", []), seed=f"{ep}")
 
             try:
                 plan = planner.plan(instruction, robots, state, ctx)
             except Exception as e:  # a planner bug must not end the whole run
                 plan = Plan(parse_ok=False, errors=[f"planner error: {e!r}"[:500]])
-            pipeline = {"rewrites": [], "check_before": None, "check_after": None, "repaired": False}
+            pipeline = {"rewrites": [], "check_before": None, "check_after": None, "repaired": False,
+                        "anonymized": dict(planner.slm.rename) if args.anonymize and uses_slm else None}
             if args.planner == "slm_only" and plan.parse_ok:
                 if args.normalize:
                     pipeline["rewrites"] += normalize(plan, object_names)
@@ -381,6 +401,8 @@ def main():
                    help="slm_only: check the plan (incl. simulated reach) and give the SLM one repair round")
     p.add_argument("--replan", type=int, default=0,
                    help="after a failed step, plan again from the current state, up to N times")
+    p.add_argument("--anonymize", action="store_true",
+                   help="E8: show the SLM pseudo-words instead of object and place names")
     p.add_argument("--max-tokens", type=int, default=4096, help="SLM output budget per call")
     p.add_argument("--engine", default="fast-downward-opt", choices=["fast-downward", "fast-downward-opt", "pyperplan"],
                    help="classical planning engine (unified-planning)")

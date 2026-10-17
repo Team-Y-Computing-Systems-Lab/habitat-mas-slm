@@ -15,6 +15,8 @@ Prompt variants (docs/findings.md explains why each exists):
                  and a fixed four-step template per object
   reach_hint   reach_v2 + the system compares heights and tells the SLM which
                  robots can handle each object (arithmetic moved out of the SLM)
+  free         reach_v2 without the four-step template (E8: is the SLM searching,
+                 or filling in the template?)
 """
 
 import json
@@ -24,7 +26,7 @@ from mas.slm.client import SLMClient, parse_json
 
 from .base import Plan, Step, validate
 
-PROMPT_VARIANTS = ("base", "reach", "reach_alloc", "reach_v2", "reach_hint")
+PROMPT_VARIANTS = ("base", "reach", "reach_alloc", "reach_v2", "reach_hint", "free")
 
 RULES = """Rules:
 - Each robot runs its own list in order. Different robots run at the same time.
@@ -71,6 +73,7 @@ SYSTEM = {
     "reach_alloc": HEAD + RULES + REACH_RULES + "\n" + FORMAT_ALLOC,
     "reach_v2": HEAD + RULES + REACH_RULES + TEMPLATE_RULES + "\n" + FORMAT,
     "reach_hint": HEAD + RULES + REACH_RULES + TEMPLATE_RULES + "\n" + FORMAT,
+    "free": HEAD + RULES + REACH_RULES + "\n" + FORMAT,
 }
 
 
@@ -172,7 +175,7 @@ class SLMOnlyPlanner:
 
     def _user(self, instruction: str, robots: List[dict], state: dict) -> str:
         geo = self.prompt != "base"
-        if self.prompt in ("reach_v2", "reach_hint"):
+        if self.prompt in ("reach_v2", "reach_hint", "free"):
             world = describe_tasks(state, robots, hint=self.prompt == "reach_hint")
         else:
             world = describe_world(state, with_heights=geo)

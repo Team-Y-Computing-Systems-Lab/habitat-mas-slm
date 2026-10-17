@@ -13,3 +13,4 @@ episode_log/
 # Python
 __pycache__/
 *.py[cod]
+generated/

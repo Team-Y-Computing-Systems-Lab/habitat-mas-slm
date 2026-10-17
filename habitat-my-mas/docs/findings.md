@@ -8,6 +8,99 @@ paths now live under `results/emos_fork_era/`.
 
 ---
 
+## 2026-10-12 · E8 set up: scaling, template ablation, anonymized names (running)
+
+**Question.** E7 cannot tell whether the SLM plans or fills in a template: its tasks have 2
+objects and the prompt fixes the four steps per object. E8 makes the problem bigger and removes
+the help, one factor at a time.
+
+| Factor | Levels | How |
+|---|---|---|
+| Objects per task | 2, 4, 6, 8 | `hssd_n{4,6,8}`: official episodes with clutter objects promoted to targets ([datasets.md](datasets.md)) |
+| SLM-only scaffolding | `reach_v2` (four-step template) vs `free` (same prompt without the template) | `--prompt free` |
+| Names | readable vs pseudo-words (`bowl_0` → `lakiga`) | `--anonymize`: the SLM client swaps names in what the model reads and swaps them back in what it writes; the map is saved per episode |
+
+Planners: P1, P2 (qwen3:4b, readable and anonymized), and P0 with repair under each prompt and
+name condition (qwen3:4b, qwen3:8b, gemma3:27b). 60 episodes, 5 per scene, all with at least 8
+objects so every N uses the same episodes. Expected outcome if the SLM is not searching: P0 falls
+with N and drops further without the template, while P1/P2 stay flat. Anonymizing names should
+hurt P2's goal translation little and P0 more, if P0 relies on household common sense.
+
+**Changes to the classical planner made for E8** (no effect on 2-object results):
+- **Allocation search.** Above 64 possible object→robot assignments, the planner used a
+  load-balancing greedy that ignored distances. It now hill-climbs on an estimated makespan (each
+  robot does its objects nearest-first) from 16 starts, then plans the 8 best allocations.
+- **One robot at a time.** With every object assigned, the robots' sub-problems are independent,
+  so each robot is planned alone. Each robot's plan is still optimal, and planning one 8-object
+  episode dropped from 156 s to 17 s with the same outcome.
+
+**Bug found:** habitat renumbers episode ids when it loads a dataset. The official files use ids
+0..N-1, so this never showed up before. Generated episodes keep the official id in
+`info.source_episode_id`.
+
+**MP3D (E8c, not built yet).** 90 scenes are on disk and load. With robot-sized navmeshes, wheeled
+robots cannot change floors and legged ones can (datasets.md), so multi-floor tasks need Spot in
+the fleet and generated episodes.
+
+Run: `systemctl --user status habitat-e8`, log `results/e8/logs/e8.log`.
+
+---
+
+## 2026-10-12 · E7: 120 episodes, 8 large and 5 small models, repair and replanning
+
+**Setup.** 120 official HSSD val episodes (10 per scene × 12 scenes, `scripts/e7_episodes.txt`),
+Fetch + Stretch, with the reach-aware pick/place from F19. One repeat per configuration, 39 runs.
+Full table: [`results/e7/summary.md`](../results/e7/summary.md), videos in `results/e7/index.html`.
+Rebuild with `.venv/bin/python scripts/analyze_matrix.py results/e7`.
+
+| Planner | Best configuration | Success | Plan tokens in / out | Plan latency |
+|---|---|---|---|---|
+| P1 classical (true goal) | + replan 2 | 59% → **63%** | 0 | 0.6 s |
+| P2 SLM + classical | any of 8 models, + replan 2 | 60–62% → **62–64%** | ~180 / 45 | 1–10 s |
+| P0 SLM-only | gemma3:27b, repair + replan 2 | 59% → **66%** | ~2850 / 565 | 11 s |
+| P0 SLM-only | qwen3:8b, repair | **62%** | ~4700 / 1400 | 29 s |
+| P0 SLM-only | qwen3:4b-instruct, norm → repair → replan | 51% → 57% → 60% | up to 2600 / 1900 | 8 s |
+| P0 SLM-only, small | gemma2:2b / smollm2:1.7b / llama3.2:3b / qwen3:0.6b | 21% / 23% / 2% / 0% | ~1100 / 200 | 2–6 s |
+
+Ceiling: in 77 of 120 episodes (64%) the trial runs found a robot for every object.
+
+**F20. With the classical planner, the language model stops mattering.** All eight models reach
+60–64% in P2, the same as P1 with the true goal. Paired on episodes, P2 gemma3:27b and P1 differ
+in 2 of 120 episodes (one each way). Goal translation is 98–100% exact for every model except
+gemma3:12b (40%). That model drops the `hand-empty` facts, which the plans satisfy anyway, so its
+success is unaffected. P2 costs about 15× fewer tokens than P0.
+
+**F21. The SLM's own plan nearly matches the classical planner, but only with heavy scaffolding.**
+P0 is within noise of P2 at the top (gemma3:27b 66% vs 63%, p = 0.25; qwen3:4b 60% vs 62%,
+p = 0.51, exact McNemar). It needs the fixed four-step template, the navigation rewrite, a checker
+with one repair round and replanning to get there. Repair is the step that clearly helps:
+qwen3:4b gains 7 episodes and loses none (p = 0.016).
+
+**F22. Model size does not predict planning quality.** qwen3:8b (62%) beats gpt-oss:20b (40%) on
+29 episodes against 3 (p < 0.001), and qwen3.6:35b gets 55%. The large reasoning models write
+invalid plans more often (gpt-oss 75% valid, qwen3.6 69%) and take 15–55 s to plan. The ranking
+follows how well a model sticks to the output format, not its size.
+
+**F23. Below about 4B parameters, SLM-only planning collapses.** gemma2:2b and smollm2:1.7b
+produce valid-looking JSON but mix up who holds what (`NOT_HOLDING`). llama3.2:3b and qwen3:0.6b
+reach 2% and 0%. For a Jetson-class model, the language model's job must be translation (P2),
+not the plan itself.
+
+**F24. The 64% ceiling is a little too low, because trial runs have false negatives.**
+82 of 120 episodes were solved by at least one run. P0 solved 1–2 episodes per run that the trials
+had marked impossible (episodes 103, 404, 704, 800, 801): P0 does not consult the feasibility
+matrix and simply tries. P1/P2 refuse to plan when one object has no feasible robot. A cheap fix
+is to treat a trial failure as "unlikely" (a high action cost) rather than impossible, or to rerun
+failed trials from a second approach pose. The other 38 episodes were never solved and match the
+height and distance limits in F19.
+
+**What this answers.** E7 does not show that small language models are good general planners. The
+plans here are 4–8 steps for 2–3 objects and 2 robots, and the prompt already fixes the steps per
+object. What the SLM contributes reliably is translation from language to goal facts. E8 tests
+the search question directly by scaling the problem.
+
+---
+
 ## 2026-10-07 · Why success stays below 73%, and a reach-aware pick/place
 
 **Gap 1: 63% achieved vs 73% possible (E6 classical-only).** In 3 episodes the trial run said

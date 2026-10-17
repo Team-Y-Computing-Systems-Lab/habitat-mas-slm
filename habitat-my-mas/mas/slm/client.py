@@ -9,7 +9,7 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from openai import OpenAI
 
@@ -42,12 +42,21 @@ class SLMClient:
         self.max_tokens = max_tokens
         self.client = OpenAI(base_url=base_url, api_key="unused", timeout=timeout)
         self.calls: List[SLMCall] = []
+        # E8 name anonymization: words replaced in what the SLM reads, restored in what it writes
+        self.rename: Dict[str, str] = {}
+
+    def _sub(self, text: str, mapping: Dict[str, str]) -> str:
+        if not mapping:
+            return text
+        pattern = re.compile(r"\b(" + "|".join(map(re.escape, sorted(mapping, key=len, reverse=True))) + r")\b")
+        return pattern.sub(lambda m: mapping[m.group(1)], text)
 
     def chat(self, system: str, user: str, json_mode: bool = True) -> SLMCall:
         t0 = time.time()
         r = self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            messages=[{"role": "system", "content": self._sub(system, self.rename)},
+                      {"role": "user", "content": self._sub(user, self.rename)}],
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             response_format={"type": "json_object"} if json_mode else None,
@@ -58,7 +67,7 @@ class SLMClient:
             prompt_tokens=r.usage.prompt_tokens if r.usage else 0,
             completion_tokens=r.usage.completion_tokens if r.usage else 0,
             latency_s=time.time() - t0,
-            output=r.choices[0].message.content or "",
+            output=self._sub(r.choices[0].message.content or "", {v: k for k, v in self.rename.items()}),
         )
         self.calls.append(call)
         return call

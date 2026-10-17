@@ -20,7 +20,7 @@ from habitat.config.default import get_config
 
 from mas.skills.catalog import skills_for
 
-from .benchmarks import BENCHMARKS, ROBOT_PREFIX
+from .benchmarks import BENCHMARKS, OVERRIDES, ROBOT_PREFIX
 from .ik import UrdfArmIK
 from .naming import NameTable
 
@@ -60,7 +60,7 @@ class SimHost:
         if benchmark not in BENCHMARKS:
             raise SimHostError("UNKNOWN_BENCHMARK", f"choose from {sorted(BENCHMARKS)}")
         self.benchmark = benchmark
-        self.config = get_config(BENCHMARKS[benchmark], overrides or [])
+        self.config = get_config(BENCHMARKS[benchmark], OVERRIDES.get(benchmark, []) + (overrides or []))
         self.env = habitat.Env(config=self.config)
 
         sim_cfg = self.config.habitat.simulator
@@ -90,14 +90,19 @@ class SimHost:
 
     # ------------------------------------------------------------------ episodes
 
+    @staticmethod
+    def _ep_id(ep) -> str:
+        """Generated datasets (E8) keep the official episode's id in info; habitat renumbers them."""
+        return str((ep.info or {}).get("source_episode_id", ep.episode_id))
+
     def episodes(self) -> List[str]:
-        return [ep.episode_id for ep in self.env.episodes]
+        return [self._ep_id(ep) for ep in self.env.episodes]
 
     def reset(self, episode_id: Optional[str] = None,
               active: Optional[List[str]] = None) -> Dict[str, Any]:
         """Load an episode. `active` lists robot ids in the fleet (default: all)."""
         if episode_id is not None:
-            matches = [ep for ep in self.env.episodes if ep.episode_id == str(episode_id)]
+            matches = [ep for ep in self.env.episodes if self._ep_id(ep) == str(episode_id)]
             if not matches:
                 raise SimHostError("UNKNOWN_EPISODE", f"episode {episode_id} not in dataset")
             self.env.current_episode = matches[0]
@@ -451,7 +456,7 @@ class SimHost:
             raise SimHostError("SIM_BUSY", "stop recording before a feasibility check")
         if episode_id is not None:
             self.reset(episode_id, active=active)
-        ep = self.env.current_episode.episode_id
+        ep = self._ep_id(self.env.current_episode)
         active = active or [r["id"] for r in self.robots if self._active.get(r["id"])]
         steps = 0
 
@@ -518,7 +523,7 @@ class SimHost:
             })
         return {
             "benchmark": self.benchmark,
-            "episode_id": ep.episode_id,
+            "episode_id": self._ep_id(ep),
             "scene_id": ep.scene_id,
             "step": self._step_count,
             "episode_over": self.env.episode_over,

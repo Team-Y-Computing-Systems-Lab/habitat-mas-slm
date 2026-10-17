@@ -29,8 +29,10 @@ Every run stores per-episode records, an HTML report and a video: top-down map p
 | P0 SLM-only, with plan normalization and one check-and-repair round | working |
 | Furniture-aware reach check (simulated trial pick/place per robot and object) | working |
 | P1 classical-only, P2 SLM + classical (unified-planning + Fast Downward) | working |
-| Recovery with replanning, resource-constraint scenarios | designed, not built (design.md §6–7) |
-| Spot in the fleet, multi-floor scenes | not set up yet |
+| Recovery: replan from the current state after failures (`--replan N`) | working (E7) |
+| Scaled episodes with 4/6/8 objects, template ablation, name anonymization (E8) | working, E8 running |
+| Matterport3D scenes (multi-floor) | downloaded and loading; episodes and Spot not set up yet |
+| Resource-constraint scenarios | designed, not built (design.md §7) |
 
 Findings so far: [docs/findings.md](docs/findings.md).
 
@@ -65,7 +67,10 @@ mas/
   planners/     slm_only.py (P0 + prompt variants), repair.py (normalize, check),
                 classical.py (P1, P2), base.py (shared plan format)
   eval/         run.py (runner), instructions.py, report.py (HTML reports)
-scripts/        run_experiments.sh (full matrix), calibrate_reach.py
+  datasets/     scale_episodes.py (E8: episodes with more target objects)
+scripts/        run_experiments.sh, run_e7.sh, run_e8.sh (experiment matrices), analyze_matrix.py,
+                calibrate_reach.py, probe_mp3d.py
+generated/      generated episodes and task specs (git-ignored, reproducible)
 tests/          smoke_sim_host.py, smoke_mcp_robots.py
 docs/           design.md, datasets.md, results.md, findings.md
 results/        experiment outputs (see docs/results.md)
@@ -112,6 +117,12 @@ ln -s $D data                            # from the repository root
 - **HSSD scenes (`hssd-hab`):** about 23 GB; the other downloads total about 2 GB.
 - **Episodes:** we use `hab3-episodes` (HSSD rearrangement, validation split).
 - **Tracked data:** `data` is ignored by git.
+- **Matterport3D (multi-floor, optional):** sign the Matterport Terms of Use, then
+  `python download_mp.py --task habitat -o /path/to/matterport3d`, unzip `v1/tasks/mp3d_habitat.zip`
+  and link `data/scene_datasets/mp3d` to the unpacked `mp3d/` folder (90 scenes, 21 GB).
+  `python scripts/probe_mp3d.py out.json` checks levels and stairs per scene.
+- **E8 scaled episodes:** `PYTHONPATH=. python -m mas.datasets.scale_episodes --n 4 6 8
+  --episode-ids $(cat scripts/e8_candidates.txt)` in `habitat-mas` writes `generated/e8/` (about 5 minutes).
 
 ### 3. Planner environment (`.venv`, Python ≥ 3.10)
 
@@ -220,6 +231,8 @@ The feasibility check tries each robot/object pair in simulation, about 20 s per
 | Prompt variants for P0 | `for v in base reach reach_alloc reach_v2 reach_hint; do .venv/bin/python -m mas.eval.run --planner slm_only --prompt $v --episodes 10 --out results/prompt_variants; done` | `results/prompt_variants/` |
 | Reach calibration (height range vs real attempt) | `conda activate habitat-mas && python scripts/calibrate_reach.py --episodes 10` | `results/reach_calibration/` |
 | Full matrix: P0 ablations, P1, P2 × models × repeats | `bash scripts/run_experiments.sh` (env vars: `EPISODES=30 REPEATS=3 MAIN_MODEL=… SMALL_MODELS="…"`) | `results/matrix/` |
+| E7: 120 episodes, 8 large and 5 small models, repair and replanning | `bash scripts/run_e7.sh` (about 30 hours) | `results/e7/` |
+| E8: 2/4/6/8 objects, template ablation, anonymized names | generate episodes (see Data), then `bash scripts/run_e8.sh` | `results/e8/` |
 
 `run_experiments.sh` starts and stops its own sim host. With the defaults (30 episodes, 3
 repeats, 5 models) it takes about 5–6 hours on one GPU. Repeat 1 of every configuration finishes

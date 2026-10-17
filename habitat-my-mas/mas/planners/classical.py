@@ -14,6 +14,8 @@ Allocation: Fast Downward minimizes *total* cost, which does not reward using
 robots in parallel. So we enumerate object->robot assignments (feasible ones
 only), solve each with an `(assigned ?r ?o)` constraint, and keep the plan with
 the smallest estimated makespan (the busiest robot's cost), then total cost.
+With many objects (more than MAX_ALLOCATIONS assignments) a local search on a
+cheap tour estimate picks the TOP_ALLOCATIONS most promising assignments first.
 """
 
 import itertools
@@ -28,7 +30,8 @@ from .base import Plan, Step
 
 NAV_BASE_STEPS = 20       # fixed cost of a navigate_to (turning, settling)
 NAV_STEPS_PER_M = 40      # sim steps per metre, fitted loosely to observed runs
-MAX_ALLOCATIONS = 64      # above this, assign greedily instead of enumerating
+MAX_ALLOCATIONS = 64      # above this, search allocations on a cost estimate instead of enumerating
+TOP_ALLOCATIONS = 8       # allocations handed to the planner after that search
 
 
 def _inner(expr: str) -> str:
@@ -117,7 +120,7 @@ class _Problem:
         self.infeasible = [o for o, rs in self.capable.items() if not rs]
         self.goal = [g for g in goal if not any(f" {o} " in g + " " for o in self.infeasible)]
 
-    def text(self, allocation: Dict[str, str]) -> str:
+    def text(self, allocation: Dict[str, str], goal: Optional[List[str]] = None) -> str:
         costs = [f"(= (nav-cost {r['id']} {a} {b}) {nav_cost(pa, pb)})"
                  for r in self.robots for a, pa in self.loc.items() for b, pb in self.loc.items() if a != b]
         assigned = [f"(assigned {r} {o})" for o, r in allocation.items()]
@@ -126,7 +129,47 @@ class _Problem:
                 + " ".join(self.loc) + " - location")
         return (f"(define (problem episode) (:domain mas)\n (:objects {objs})\n"
                 f" (:init {' '.join(self.init + assigned + costs)} (= (total-cost) 0))\n"
-                f" (:goal (and {' '.join(self.goal)}))\n (:metric minimize (total-cost)))")
+                f" (:goal (and {' '.join(self.goal if goal is None else goal)}))\n (:metric minimize (total-cost)))")
+
+
+def _estimate(prob: "_Problem", alloc: Dict[str, str]) -> Tuple[int, int]:
+    """(makespan, total) of an allocation, each robot doing its objects in nearest-first order."""
+    goal_loc = {o["name"]: prob.loc.get(o["goal_receptacle"]) for o in prob.objects}
+    per = {}
+    for r in prob.robots:
+        here, cost = prob.loc[f"start_{r['id']}"], 0
+        left = [o for o, rr in alloc.items() if rr == r["id"]]
+        while left:
+            o = min(left, key=lambda x: math.dist(here, prob.loc[f"at_{x}"]))
+            left.remove(o)
+            cost += nav_cost(here, prob.loc[f"at_{o}"]) + nav_cost(prob.loc[f"at_{o}"], goal_loc[o]) + 160
+            here = goal_loc[o]
+        per[r["id"]] = cost
+    return max(per.values(), default=0), sum(per.values())
+
+
+def _search_allocations(prob: "_Problem", options: Dict[str, List[str]]) -> List[Dict[str, str]]:
+    """Hill-climb over single-object reassignments from several starts; best distinct results."""
+    import random
+    rng = random.Random(0)
+    seen: Dict[tuple, Tuple[int, int]] = {}
+    for start in range(16):
+        alloc = {o: (rs[0] if start == 0 else rng.choice(rs)) for o, rs in options.items()}
+        best = _estimate(prob, alloc)
+        improved = True
+        while improved:
+            improved = False
+            for o, rs in options.items():
+                for r in rs:
+                    if r == alloc[o]:
+                        continue
+                    cand = {**alloc, o: r}
+                    c = _estimate(prob, cand)
+                    if c < best:
+                        alloc, best, improved = cand, c, True
+            seen[tuple(sorted(alloc.items()))] = best
+    ranked = sorted(seen.items(), key=lambda kv: kv[1])[:TOP_ALLOCATIONS]
+    return [dict(k) for k, _ in ranked]
 
 
 class ClassicalPlanner:
@@ -144,6 +187,30 @@ class ClassicalPlanner:
         if res.plan is None:
             return None, res.status.name
         return [(a.action.name, [str(p) for p in a.actual_parameters]) for a in res.plan.actions], res.status.name
+
+    def _solve_allocation(self, domain: str, prob: _Problem, alloc: Dict[str, str]) -> Tuple[Optional[list], str]:
+        """With every object assigned, the robots' sub-problems are independent (no shared
+        resources in the domain), so each robot is solved alone: same optimal plan per robot,
+        far smaller searches when there are many objects."""
+        def mine(fact: str, rid: str) -> bool:
+            args = fact.strip("()").split()[1:]
+            return rid in args or any(alloc.get(a) == rid for a in args)
+        init = set(prob.init)
+        unowned = [g for g in prob.goal if g not in init and not any(mine(g, r["id"]) for r in prob.robots)]
+        if unowned:  # a goal fact no single robot owns: solve jointly
+            return self._solve(domain, prob.text(alloc))
+        actions, statuses = [], []
+        for r in prob.robots:
+            goal = [g for g in prob.goal if g not in init and mine(g, r["id"])]
+            if not goal:
+                continue
+            sub = {o: rr for o, rr in alloc.items() if rr == r["id"]}
+            acts, status = self._solve(domain, prob.text(sub, goal))
+            statuses.append(status)
+            if acts is None:
+                return None, status
+            actions += acts
+        return actions, statuses[0] if statuses else "SOLVED_OPTIMALLY"
 
     @staticmethod
     def _costs(actions, prob: _Problem) -> Dict[str, int]:
@@ -176,18 +243,12 @@ class ClassicalPlanner:
             n *= len(opt)
         if n <= MAX_ALLOCATIONS:
             allocations = [dict(zip(todo, combo)) for combo in itertools.product(*options)] or [{}]
-        else:  # greedy: give each object to the capable robot with the fewest so far
-            load: Dict[str, int] = {}
-            alloc = {}
-            for o, rs in zip(todo, options):
-                r = min(rs, key=lambda x: load.get(x, 0))
-                alloc[o] = r
-                load[r] = load.get(r, 0) + 1
-            allocations = [alloc]
+        else:
+            allocations = _search_allocations(prob, dict(zip(todo, options)))
 
         best, tried = None, []
         for alloc in allocations:
-            actions, status = self._solve(domain, prob.text(alloc))
+            actions, status = self._solve_allocation(domain, prob, alloc)
             if actions is None:
                 tried.append({"allocation": alloc, "status": status})
                 continue
