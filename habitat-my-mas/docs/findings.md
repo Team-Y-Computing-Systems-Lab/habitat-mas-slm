@@ -8,7 +8,98 @@ paths now live under `results/emos_fork_era/`.
 
 ---
 
-## 2026-10-12 · E8 set up: scaling, template ablation, anonymized names (running)
+## 2026-10-29 · E9 pilot gate: receptacle occupancy almost never binds (gate failed)
+
+**Setup.** Sim host with the new receptacle-occupancy rule: a robot waits if another robot is
+doing a pick or place with its base within 0.8 m. 10 hub episodes with 8 objects
+(`hssd_hub_n8`, all goals on 1–2 shared receptacles). Condition A (plain planner) against B
+(hand-written: true exclusive receptacles from the simulator's capacity check, scheduled waits,
+the `carry` macro, and landmarks from the feasibility trials). Results in `results/e9/pilot/`,
+table from `scripts/analyze_e9.py results/e9/pilot`.
+
+| | Success | Sub-goals | Makespan | Waits (steps) in 10 episodes | Planning time |
+|---|---|---|---|---|---|
+| A plain | 30% | 83% | 1624 | 2 (9) | 39 s |
+| B hand | 50% (2 better, 0 worse, p = 0.5) | 95% | 1713 (+89, p = 0.11) | 3 (27) | 71 s (p < 0.01) |
+
+**F30. Robots almost never meet at a receptacle, even when all goals share one or two of
+them.** Ten 8-object episodes produced 2 waits (9 steps) with the plain planner. Hubs are
+large and shared (21 of 145 contended receptacles are exclusive), and the robots seldom arrive
+at the same moment. Knowing which receptacles are exclusive therefore cannot shorten execution
+here. That was the gate's question, so the full E9 run was not started.
+
+**F31. Where robots do overlap is on the move, and that is not modelled yet.** Robot bases were
+closer than 0.6 m for 680 steps (A) and 968 steps (B) across 10 episodes, about 70–100 per
+episode, while waits at receptacles totalled 9–27 steps. In kinematic mode, robots drive
+through each other on the navmesh. The real interference in this setup is navigation, so
+mutexes on corridors, doorways and narrow passages would be the meaningful resource.
+
+**F32. The hand-written macro costs more than it saves.** `carry` is used in every plan (2,704
+macro steps), with the same number of expanded states as A (67k vs 67k). Planning time still
+nearly doubles (71 s vs 39 s, p < 0.01), from grounding the macro and its cost table. With
+2 robots, Fast Downward's search on per-robot sub-problems is already small, so macros have
+nothing to speed up. B's 2 extra successes are not significant (p = 0.5); they are not
+explained by interference, since waits barely occurred.
+
+**Also seen in the smoke test:** qwen3:8b's landmark proposals were all correct, because the
+prompt lists the trial results. Its exclusive proposals were wrong 3 out of 3: it marks small
+receptacles exclusive, but the simulator finds two reachable spots ≥ 0.8 m apart.
+
+---
+
+## 2026-10-27 · E8 results: SLM-only planning degrades with problem size; the classical planner does not
+
+48 runs, finished 2026-10-14 (`results/e8/`, setup in the next entry). 60 episodes per object
+count N, the same episodes at every N. Plain success falls for every planner as N grows, because
+one unmovable object fails the whole episode. So the table compares planners where they all can
+win: **success on the "ceiling" episodes**, where the trial runs found a robot for every object
+(43, 33, 28 and 27 of 60 at N = 2, 4, 6, 8).
+
+| Planner (repair on for P0) | N=2 | N=4 | N=6 | N=8 | Sub-goals N=8 |
+|---|---|---|---|---|---|
+| P1 classical | 93% | 91% | 75% | 78% | 85% |
+| P2 qwen3:4b (anonymized names) | 91% (95%) | 76% (82%) | 64% (75%) | 81% (81%) | 83% (85%) |
+| P0 gemma3:27b, template | 81% | 73% | 71% | 78% | 65% |
+| P0 qwen3:8b, template | 93% | 76% | 68% | 59% | 62% |
+| P0 qwen3:4b, template | 86% | 70% | 54% | **26%** | 58% |
+| P0 gemma3:27b / qwen3:8b / qwen3:4b, no template | 84 / 86 / 84% | 88 / 79 / 67% | 68 / 61 / 54% | 70 / 52 / **37%** | 68 / 57 / 60% |
+
+**F25. The gap opens with problem size.** At N=2, P0 is a few points behind P1 (sub-goals +2 to
++5 points for P1). At N=8 the gap is 20–26 points of sub-goals for all three models, and P1 does
+better in 31–46 episodes and worse in 3–6 (sign test p < 0.001). P1 and P2 stay roughly flat on
+ceiling episodes, about 75–90%.
+
+**F26. The SLM fails at allocation, not at listing steps.** At N=8, P0 plans almost never leave
+an object out (0–0.3 per episode). They fail because they give objects to a robot that cannot
+reach them: 51–58 `OUT_OF_REACH` failures per 60 episodes, against 13 for P1. qwen3:4b also puts
+everything on one robot in 15 of 60 episodes, which runs out of time. Reasoning over the
+robot × object reach constraints is the part that does not scale, and that part is search.
+
+**F27. The template is not what makes P0 work.** Pooled over N = 4–8, removing the four-step
+template changes sub-goals by −0.2, +4.0 and −3.7 points for qwen3:4b, qwen3:8b and gemma3:27b.
+Neither direction is consistent. The models know the pick-and-place pattern without being told.
+That is consistent with F26: the hard part is choosing who does what.
+
+**F28. Readable names do not help.** Swapping object and place names for pseudo-words changes P0
+sub-goals by less than 1 point for every model. P2's goal translation is *more* exact with
+pseudo-words (239/240 vs 230/240 episodes), probably because the model cannot "correct" a name it
+does not recognise. The SLMs do not rely on household common sense in these tasks; the
+instruction names every object and place explicitly.
+
+**F29. Cost.** At N=8 P0 uses 3–9k input and 1.4–4k output tokens per episode and 15–55 s of
+planning. P2 uses about 330/130 tokens. P1/P2 planning time grows to about 1 minute per episode
+(Fast Downward on 8 candidate allocations), still cheaper than P0 with qwen3:8b.
+
+**What this answers (the question from 2026-10-12).** The SLM's own plans look good on 2-object
+tasks because the search there is trivial. As soon as allocation under reach constraints has
+more than a few options, SLM-only plans degrade steadily, while the classical planner holds. In
+this system the SLM is a good translator (P2, 94–100% exact goals at every N), not a general
+search procedure. Caveats: one repeat; 27–43 ceiling episodes per N, so differences of 5–10
+points at a single N are within noise. Only the trend across N and the paired tests are reliable.
+
+---
+
+## 2026-10-12 · E8 set up: scaling, template ablation, anonymized names
 
 **Question.** E7 cannot tell whether the SLM plans or fills in a template: its tasks have 2
 objects and the prompt fixes the four steps per object. E8 makes the problem bigger and removes

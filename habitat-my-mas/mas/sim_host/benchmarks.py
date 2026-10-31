@@ -24,6 +24,13 @@ for _n in (4, 6, 8):
         f"habitat.task.task_spec_base_path={_GEN}",
         f"habitat.task.task_spec=tidy_house_n{_n}",
     ]
+    # E9 contention set: the same episodes, every goal on 1-2 shared "hub" receptacles
+    BENCHMARKS[f"hssd_hub_n{_n}"] = BENCHMARKS["hssd_fetch_stretch"]
+    OVERRIDES[f"hssd_hub_n{_n}"] = [
+        f"habitat.dataset.data_path={_GEN}/hssd_hub_n{_n}.json.gz",
+        f"habitat.task.task_spec_base_path={_GEN}",
+        f"habitat.task.task_spec=tidy_house_n{_n}",
+    ]
 
 # articulated_agent_type -> short robot-id prefix
 ROBOT_PREFIX = {

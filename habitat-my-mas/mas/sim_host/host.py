@@ -56,7 +56,7 @@ def _jsonable(x: Any) -> Any:
 
 
 class SimHost:
-    def __init__(self, benchmark: str, overrides: Optional[List[str]] = None):
+    def __init__(self, benchmark: str, overrides: Optional[List[str]] = None, occupancy: bool = False):
         if benchmark not in BENCHMARKS:
             raise SimHostError("UNKNOWN_BENCHMARK", f"choose from {sorted(BENCHMARKS)}")
         self.benchmark = benchmark
@@ -87,6 +87,10 @@ class SimHost:
         self._recorder = None
         self._arms: Dict[str, UrdfArmIK] = {}      # built on first use
         self._rest_q: Dict[str, np.ndarray] = {}   # arm pose after reset
+        # E9 receptacle occupancy (skills.py ArmSkill): a robot at work claims its base spot
+        self.occupancy = occupancy
+        self._claims: Dict[str, tuple] = {}         # robot -> (base xz, receptacle, step)
+        self._interference = self._new_interference()
 
     # ------------------------------------------------------------------ episodes
 
@@ -112,6 +116,8 @@ class SimHost:
         self._step_count = 0
         self.labels = {}
         self._index_episode()
+        self._claims = {}
+        self._interference = self._new_interference()
         for r in self.robots:
             art = self._agent(r["id"]).articulated_agent
             self._rest_q[r["id"]] = np.array(art.arm_joint_pos)
@@ -564,10 +570,104 @@ class SimHost:
             raise SimHostError("EPISODE_OVER", "call reset first")
         self._last_obs = self.env.step({"action": tuple(names), "action_args": args})
         self._step_count += 1
+        self._count_overlap()
         if self._recorder is not None:
             self._recorder.capture(self._step_count)
         return {"step": self._step_count, "episode_over": self.env.episode_over,
                 "robots": self.fleet(), "metrics": _jsonable(self.env.get_metrics())}
+
+    # ------------------------------------------------------ E9: interference
+
+    @staticmethod
+    def _new_interference() -> Dict[str, Any]:
+        return {"waits": 0, "wait_steps": 0, "busy_failures": 0, "overlap_steps": 0, "conflicts": []}
+
+    def _base_xz(self, robot_id: str) -> np.ndarray:
+        return np.array(self._agent(robot_id).articulated_agent.base_pos)[[0, 2]]
+
+    def claim_spot(self, robot_id: str, receptacle: Optional[str]) -> None:
+        """Called every step while `robot_id`'s arm is at work; a claim lapses if not renewed."""
+        self._claims[robot_id] = (self._base_xz(robot_id), receptacle, self._step_count)
+
+    def spot_blocker(self, robot_id: str, d_min: float = 0.8) -> Optional[str]:
+        """Another robot working with its base within d_min of this robot's base, if any."""
+        me = self._base_xz(robot_id)
+        for other, (xz, _, step) in self._claims.items():
+            if other != robot_id and self._active.get(other) and step >= self._step_count - 1 \
+                    and float(np.linalg.norm(xz - me)) < d_min:
+                return other
+        return None
+
+    def note_wait(self, robot_id: str, blocker: str, receptacle: Optional[str], first: bool) -> None:
+        st = self._interference
+        st["wait_steps"] += 1
+        if first:
+            st["waits"] += 1
+            st["conflicts"].append({"robot": robot_id, "blocked_by": blocker, "receptacle": receptacle,
+                                    "blocker_receptacle": self._claims.get(blocker, (None, None))[1],
+                                    "step": self._step_count})
+
+    def note_busy_failure(self) -> None:
+        self._interference["busy_failures"] += 1
+
+    def _count_overlap(self, d: float = 0.6) -> None:
+        act = [r["id"] for r in self.robots if self._active.get(r["id"])]
+        for i, a in enumerate(act):
+            for b in act[i + 1:]:
+                if float(np.linalg.norm(self._base_xz(a) - self._base_xz(b))) < d:
+                    self._interference["overlap_steps"] += 1
+
+    def receptacle_info(self) -> Dict[str, Dict[str, Any]]:
+        """Footprint (length x width, m), centre and top height of each task place."""
+        sim = self.env.sim
+        out = {}
+        for name in self.places():
+            h = self._names.handle(name)
+            obj = sim.get_rigid_object_manager().get_object_by_handle(h) if h else None
+            obj = obj or (sim.get_articulated_object_manager().get_object_by_handle(h) if h else None)
+            if obj is None:
+                continue
+            bb = obj.root_scene_node.cumulative_bb
+            corners = [obj.transformation.transform_point(c) for c in
+                       (bb.back_bottom_left, bb.back_bottom_right, bb.front_top_left, bb.front_top_right,
+                        bb.back_top_left, bb.back_top_right, bb.front_bottom_left, bb.front_bottom_right)]
+            c = np.array([[v[0], v[1], v[2]] for v in corners])
+            ext = c.max(0) - c.min(0)
+            out[name] = {"size_xz": sorted([float(ext[0]), float(ext[2])], reverse=True),
+                         "centre": _jsonable((c.max(0) + c.min(0)) / 2),
+                         "top_height_m": round(float(c.max(0)[1]) - self._floor_y, 2)}
+        return out
+
+    def receptacle_capacity(self, d_min: float = 0.8) -> Dict[str, Any]:
+        """E9 ground truth for mutex proposals. For each place used by two or more task spots
+        (objects starting there, goal spots there): 'exclusive' if no two robots can work at two
+        different spots on it with their bases at least d_min apart, 'shared' if they can.
+        Uses the pick/place skill's own IK pose model (skills.reach_poses)."""
+        from .skills import reach_poses
+        spots: Dict[str, List[np.ndarray]] = {}
+        for i, o in enumerate(self._objects):
+            start = self._obj_place.get(o["name"])
+            if start:
+                spots.setdefault(start, []).append(np.array(self.entity_pos(self.resolve_object(o["name"]))))
+            if o["goal"]:
+                spots.setdefault(o["goal"], []).append(
+                    np.array(self.entity_pos(self._entity_idx[f"TARGET_any_targets|{i}"])))
+        robots = [r["id"] for r in self.robots if self._active.get(r["id"]) and self.has_arm(r["id"])]
+        out = {}
+        for place, pts in spots.items():
+            if len(pts) < 2:
+                continue
+            poses = {(rid, k): reach_poses(self, rid, p) for rid in robots for k, p in enumerate(pts)}
+            shared = any(
+                np.linalg.norm(a - b) >= d_min
+                for (r1, k1), pa in poses.items() for (r2, k2), pb in poses.items()
+                if r1 < r2 and k1 != k2 for a in pa for b in pb)
+            out[place] = {"exclusive": not shared, "spots": len(pts),
+                          "poses": {f"{r}:{k}": len(v) for (r, k), v in poses.items()}}
+        return out
+
+    def interference_stats(self) -> Dict[str, Any]:
+        return {**self._interference, "occupancy": self.occupancy}
 
     # ---------------------------------------------------------------- recording
 

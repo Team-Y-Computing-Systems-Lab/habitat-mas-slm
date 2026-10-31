@@ -1,7 +1,8 @@
 # Results format
 
 Each experiment has its own folder (`results/matrix/`, `results/prompt_variants/`, ...) with its
-own `index.html`. Runs made on EMOS's fork before 2026-09-26 are in `results/emos_fork_era/`. Every planner mode writes the same format, so runs can be compared directly:
+own `index.html`. `results/` is a symlink to `/data/rlwagun/habitat-my-mas/results` (the large
+disk; moved 2026-10-29). On a new machine, create the folder anywhere and link it as `results`. Runs made on EMOS's fork before 2026-09-26 are in `results/emos_fork_era/`. Every planner mode writes the same format, so runs can be compared directly:
 
 - **P0 `slm_only`:** the SLM writes the plan.
 - **P1 `classical_only`:** PDDL goal → classical planner.

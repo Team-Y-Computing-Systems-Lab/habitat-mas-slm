@@ -73,7 +73,7 @@ scripts/        run_experiments.sh, run_e7.sh, run_e8.sh (experiment matrices), 
 generated/      generated episodes and task specs (git-ignored, reproducible)
 tests/          smoke_sim_host.py, smoke_mcp_robots.py
 docs/           design.md, datasets.md, results.md, findings.md
-results/        experiment outputs (see docs/results.md)
+results -> …    symlink to the experiment outputs on the large disk (see docs/results.md)
 data -> …       symlink to the official Habitat data folder
 ```
 

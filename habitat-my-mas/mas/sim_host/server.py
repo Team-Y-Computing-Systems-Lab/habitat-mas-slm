@@ -55,6 +55,8 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--max-steps", type=int, default=3000,
                    help="episode step budget; 750 (a common rearrangement default) is too few for multi-skill plans")
+    p.add_argument("--occupancy", action="store_true",
+                   help="E9: robots must wait for a busy receptacle spot (skills.py D_MIN, T_MAX)")
     p.add_argument("overrides", nargs="*", help="hydra overrides for the habitat config")
     args = p.parse_args()
 
@@ -62,12 +64,12 @@ def main():
     overrides = [
         f"habitat.environment.max_episode_steps={args.max_steps}",
     ] + args.overrides
-    host = SimHost(args.benchmark, overrides)
+    host = SimHost(args.benchmark, overrides, occupancy=args.occupancy)
     scheduler = Scheduler(host)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(scheduler))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"[sim_host] {args.benchmark}: pool={[r['id'] for r in host.robots]} "
+    print(f"[sim_host] {args.benchmark} (occupancy {'on' if args.occupancy else 'off'}): pool={[r['id'] for r in host.robots]} "
           f"episodes={len(host.env.episodes)} listening on {args.host}:{args.port}", flush=True)
     scheduler.run_forever()  # the simulator stays on the main thread
 

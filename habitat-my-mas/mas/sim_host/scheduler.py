@@ -20,7 +20,8 @@ from .skills import SkillFailure, SkillRunner, make_runner
 # methods callable directly on the host between sim steps
 HOST_METHODS = {"info", "episodes", "reset", "state", "fleet", "robot",
                 "activate", "deactivate", "step", "skills", "facts", "task_goal", "goal_status", "arm_reach", "feasibility",
-                "start_recording", "stop_recording"}
+                "start_recording", "stop_recording",
+                "interference_stats", "receptacle_info", "receptacle_capacity"}  # E9
 
 
 class _Request:
@@ -69,7 +70,7 @@ class Scheduler:
                 return req.finish(result={rid: name for rid, (_, _, name) in self.active.items()})
             if req.method not in HOST_METHODS:
                 raise SimHostError("UNKNOWN_METHOD", req.method)
-            if req.method in ("step", "reset", "feasibility") and self.active:
+            if req.method in ("step", "reset", "feasibility", "receptacle_capacity") and self.active:
                 raise SimHostError("SIM_BUSY", f"skills running: {sorted(self.active)}")
             result = getattr(self.host, req.method)(**req.params)
             if req.method == "deactivate":

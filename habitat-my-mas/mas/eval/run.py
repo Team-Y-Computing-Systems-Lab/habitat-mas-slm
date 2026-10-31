@@ -165,6 +165,10 @@ def summarize(records: List[dict]) -> dict:
         "avg_plan_rewrites": round(sum(r["metrics"].get("plan_rewrites", 0) for r in records) / n, 2),
         "avg_replans": round(sum(r["metrics"].get("replans", 0) for r in records) / n, 2),
         "failure_codes": codes,
+        **({"avg_waits": round(sum(r["metrics"]["interference"]["waits"] for r in records) / n, 2),
+            "avg_wait_steps": round(sum(r["metrics"]["interference"]["wait_steps"] for r in records) / n, 1),
+            "avg_overlap_steps": round(sum(r["metrics"]["interference"]["overlap_steps"] for r in records) / n, 1)}
+           if all("interference" in r["metrics"] for r in records) else {}),
     }
 
 
@@ -187,6 +191,78 @@ def anonymize(names: List[str], seed: str) -> Dict[str, str]:
     return out
 
 
+def build_aid(args, sim, planner, robots, state, feas, goal, ep, cache_dir) -> tuple:
+    """E9: the model additions for condition args.aid, and a record of proposal and checks.
+    A none, B hand, C slm_raw, D slm_verified, E slm_hint (docs/e9_design.md §5)."""
+    from mas.planners import model_aid as ma
+    bench = state["benchmark"]
+    cap_path = os.path.join(cache_dir, "capacity", bench, f"{ep}.json")
+    if os.path.exists(cap_path):
+        truth = json.load(open(cap_path))
+    else:
+        truth = {"capacity": sim.call("receptacle_capacity"), "receptacles": sim.call("receptacle_info")}
+        os.makedirs(os.path.dirname(cap_path), exist_ok=True)
+        json.dump(truth, open(cap_path, "w"), indent=1)
+    true_excl = {p for p, v in truth["capacity"].items() if v["exclusive"]}
+    schemas = ma.schemas_from_tools(robots)
+    log = {"mode": args.aid, "true_exclusive": sorted(true_excl)}
+    if args.aid == "none":
+        return {}, log
+    if args.aid == "hand":
+        lms = [f"(holding {rs[0]} {o})" for o, rs in _capable(feas, state).items() if len(rs) == 1]
+        return {"exclusive": true_excl, "insert_waits": True, "landmarks": lms,
+                "macros": [ma.compose_macro(ma.HAND_MACRO, schemas)]}, log
+    tag = re.sub(r"[^A-Za-z0-9.]+", "-", args.aid_model)
+    prop_path = os.path.join(cache_dir, "proposals", bench, tag, f"{ep}.json")
+    if os.path.exists(prop_path):
+        res = json.load(open(prop_path))
+    else:
+        res = ma.propose(SLMClient(args.aid_model, base_url=args.slm_url, max_tokens=args.max_tokens),
+                         robots, state, truth["receptacles"], feas, schemas)
+        os.makedirs(os.path.dirname(prop_path), exist_ok=True)
+        json.dump(res, open(prop_path, "w"), indent=1)
+    prop = res["proposal"]
+    # score every proposal against the truth, whatever the condition does with it
+    contended = set(truth["capacity"])
+    excl = set(prop["exclusive"])
+    lm_ok = {lm: planner.is_landmark(lm, robots, state, feas, goal) for lm in prop["landmarks"]}
+    macros_ok, macros_bad = [], []
+    for m in prop["macros"]:
+        try:
+            macros_ok.append(ma.compose_macro(m, schemas))
+        except ma.MacroError as e:
+            macros_bad.append({"macro": m, "error": str(e)})
+    log.update({
+        "proposal": prop, "json_ok": res["json_ok"],
+        "tokens_in": res["call"]["prompt_tokens"], "tokens_out": res["call"]["completion_tokens"],
+        "latency_s": res["call"]["latency_s"],
+        "exclusive_correct": sorted(excl & true_excl),
+        "exclusive_false": sorted(excl & (contended - true_excl)),      # says exclusive, sim says shared
+        "exclusive_unneeded": sorted(excl - contended),                   # fewer than two spots there
+        "exclusive_missed": sorted(true_excl - excl),
+        "landmarks_true": sorted(k for k, v in lm_ok.items() if v),
+        "landmarks_false": sorted(k for k, v in lm_ok.items() if not v),
+        "macros_composed": [m["name"] for m in macros_ok], "macros_rejected": macros_bad,
+        "invalid": prop["invalid"],
+    })
+    if args.aid == "slm_raw":
+        return {"exclusive": excl, "insert_waits": True, "landmarks": prop["landmarks"],
+                "macros": macros_ok, "replay": False}, log
+    if args.aid == "slm_verified":
+        return {"exclusive": excl & true_excl, "insert_waits": True,
+                "landmarks": log["landmarks_true"], "macros": macros_ok}, log
+    return {"exclusive": excl, "insert_waits": False}, log   # slm_hint: ranks allocations only
+
+
+def _capable(feas: dict, state: dict) -> Dict[str, List[str]]:
+    out = {o["name"]: [] for o in state["objects"]}
+    for rid, row in (feas or {}).items():
+        for o, v in row.items():
+            if o in out and v.get("pick") == "OK" and v.get("place") == "OK":
+                out[o].append(rid)
+    return out
+
+
 def make_planner(args):
     if args.planner == "slm_only":
         return SLMOnlyPlanner(SLMClient(args.model, base_url=args.slm_url, max_tokens=args.max_tokens),
@@ -199,7 +275,8 @@ def make_planner(args):
 
 def run_tag(args) -> str:
     """Short name of the configuration, used in run ids and the index."""
-    extra = ([f"replan{args.replan}"] if args.replan else []) + (["anon"] if args.anonymize else [])
+    extra = ([f"replan{args.replan}"] if args.replan else []) + (["anon"] if args.anonymize else []) \
+        + ([f"aid_{args.aid}"] if args.aid else [])
     if args.planner == "slm_only":
         return "+".join([args.prompt] + (["norm"] if args.normalize else []) + (["repair"] if args.repair else []) + extra)
     return "+".join([args.engine] + extra)
@@ -228,6 +305,8 @@ async def main_async(args):
     needs_feas = args.planner != "slm_only" or args.repair
     tag = run_tag(args)
     model_tag = re.sub(r"[^A-Za-z0-9.]+", "-", args.model) if uses_slm else "none"
+    if args.aid and args.aid.startswith("slm"):  # E9: the proposing SLM names the run
+        model_tag = re.sub(r"[^A-Za-z0-9.]+", "-", args.aid_model)
     if args.skip_existing:  # resume a matrix: a finished run with this config/model/repeat exists
         import glob as _glob
         pattern = os.path.join(os.path.abspath(args.out), info["benchmark"],
@@ -249,6 +328,7 @@ async def main_async(args):
               "model": args.model if uses_slm else None, "slm_url": args.slm_url if uses_slm else None,
               "repeat": args.repeat, "episodes": episodes, "fleet": robot_ids,
               "instruction_level": "explicit", "anonymize": args.anonymize,
+              "aid": args.aid, "aid_model": args.aid_model if args.aid and args.aid.startswith("slm") else None,
               "recovery": f"replan x{args.replan}" if args.replan else "none", "feasibility_check": needs_feas,
               "video": not args.no_video, "started": datetime.now().isoformat(timespec="seconds")}
     json.dump(config, open(os.path.join(run_dir, "config.json"), "w"), indent=2)
@@ -271,6 +351,11 @@ async def main_async(args):
             instruction = explicit(goal)
             print(f"\n[ep {ep}] {instruction}", flush=True)
             ctx = {"goal": goal, "feasibility": feas["matrix"] if feas else None}
+            e9 = None
+            if args.aid:
+                aid, e9 = build_aid(args, sim, planner, robots, state, ctx["feasibility"], goal, ep,
+                                    args.e9_cache)
+                ctx["aid"] = aid
             if args.anonymize and uses_slm:
                 planner.slm.rename = anonymize(object_names + state.get("places", []), seed=f"{ep}")
 
@@ -363,6 +448,7 @@ async def main_async(args):
                 check_problems_after=len(pipeline["check_after"] or []) if pipeline["repaired"] else None,
                 feasibility_sim_steps=feas["sim_steps"] if feas else 0,
                 feasibility_wall_s=(feas.get("wall_s", 0) if feas and not feas.get("cached") else 0),
+                interference=sim.call("interference_stats"),  # E9: waits, conflicts, base overlap
             )
             record = {
                 "run_id": run_id, "benchmark": info["benchmark"], "episode_id": ep,
@@ -370,7 +456,7 @@ async def main_async(args):
                 "fleet": robot_ids, "instruction": instruction, "goal": goal,
                 "initial_facts": state["facts"], "final_facts": final["facts"],
                 "plan": {r: [vars(s) for s in steps] for r, steps in plan.steps.items()},
-                "plan_errors": plan.errors, "pipeline": pipeline,
+                "plan_errors": plan.errors, "pipeline": pipeline, "e9": e9,
                 "feasibility": feas["matrix"] if feas else None,
                 "trace": trace, "execution_wall_s": wall, "metrics": metrics,
                 "video": os.path.relpath(video["video"], run_dir) if video else None,
@@ -401,6 +487,11 @@ def main():
                    help="slm_only: check the plan (incl. simulated reach) and give the SLM one repair round")
     p.add_argument("--replan", type=int, default=0,
                    help="after a failed step, plan again from the current state, up to N times")
+    p.add_argument("--aid", choices=["none", "hand", "slm_raw", "slm_verified", "slm_hint"],
+                   help="E9 model additions for the classical planner (A none, B hand, C-E SLM)")
+    p.add_argument("--aid-model", default="qwen3:8b", help="E9: SLM that proposes the additions")
+    p.add_argument("--e9-cache", default=os.path.join(PROJECT_ROOT, "results", "e9"),
+                   help="E9: where capacity checks and SLM proposals are cached")
     p.add_argument("--anonymize", action="store_true",
                    help="E8: show the SLM pseudo-words instead of object and place names")
     p.add_argument("--max-tokens", type=int, default=4096, help="SLM output budget per call")

@@ -146,14 +146,102 @@ def promote(env, ep_json: dict, n: int, rng: random.Random) -> dict:
     return out
 
 
+def hub_path(n: int) -> str:
+    return os.path.join(OUT_DIR, f"hssd_hub_n{n}.json.gz")
+
+
+def to_hub(env, ep_json: dict, hubs: int, rng: random.Random) -> dict:
+    """E9 contention set: the same episode (objects, starts, targets) with every goal spot
+    re-sampled on `hubs` shared receptacles ("set the table"), so robots meet at them.
+    Hubs are the receptacles with the most reachable spots; an object never gets its own
+    start receptacle as goal. Returns None if a goal spot cannot be found."""
+    from habitat.datasets.rearrange.samplers.receptacle import find_receptacles
+    from habitat.sims.habitat_simulator.sim_utilities import snap_down
+
+    sim = env.sim
+    rom = sim.get_rigid_object_manager()
+    aom = sim.get_articulated_object_manager()
+    floor = float(np.median([np.array(sim.get_agent_data(i).articulated_agent.base_pos)[1]
+                             for i in range(sim.num_articulated_agents)]))
+    recs = [r for r in find_receptacles(sim) if r.parent_object_handle]
+
+    def reachable(p):
+        if not H_MIN <= p[1] - floor <= H_MAX:
+            return False
+        nav = np.array(sim.pathfinder.snap_point(p))
+        return not (np.isnan(nav).any() or np.linalg.norm((nav - np.array(p))[[0, 2]]) > NAV_DIST
+                    or abs(nav[1] - floor) > 0.3)
+
+    score = {}
+    for r in recs:
+        score[r.parent_object_handle] = score.get(r.parent_object_handle, 0) + \
+            sum(reachable(r.sample_uniform_global(sim, 1.0)) for _ in range(20))
+    hub_parents = sorted(score, key=lambda h: -score[h])[:hubs]
+    if not hub_parents or score[hub_parents[0]] == 0:
+        return None
+    hub_recs = [r for r in recs if r.parent_object_handle in hub_parents]
+
+    out = copy.deepcopy(ep_json)
+    labels = sorted(out["info"]["object_labels"].items(), key=lambda kv: int(kv[1].split("|")[1]))
+    taken = [np.array(rom.get_object_by_handle(h).translation) for h, _ in labels]
+    for handle, label in labels:
+        i = int(label.split("|")[1])
+        obj = rom.get_object_by_handle(handle)
+        start_parent = out["target_receptacles"][i][0]
+        saved, goal = obj.transformation, None
+        for _ in range(TRIES):
+            rec = rng.choice(hub_recs)
+            if rec.parent_object_handle == start_parent:
+                continue
+            p = rec.sample_uniform_global(sim, 1.0)
+            if not reachable(p) or any(np.linalg.norm(np.array(p) - g) < GOAL_SEP for g in taken):
+                continue
+            parent = rom.get_object_by_handle(rec.parent_object_handle) \
+                or aom.get_object_by_handle(rec.parent_object_handle)
+            obj.translation = p + np.array([0, 0.08, 0])
+            ok = snap_down(sim, obj, [parent.object_id] if parent else None)
+            if ok and abs(obj.translation[1] - p[1]) <= 0.15 and H_MIN <= obj.translation[1] - floor <= H_MAX:
+                goal = (obj.transformation, rec.parent_object_handle)
+            obj.transformation = saved
+            if goal:
+                break
+        if goal is None:
+            return None
+        out["targets"][handle] = [list(map(float, row)) for row in np.array(goal[0])]
+        out["goal_receptacles"][i] = [goal[1], None]
+        taken.append(np.array(goal[0])[:3, 3])
+    out["info"]["hubs"] = hub_parents
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n", type=int, nargs="+", default=[4, 6, 8])
     ap.add_argument("--episode-ids", nargs="+", required=True)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--hub", type=int, default=0,
+                    help="E9: build hssd_hub_n{N} from the existing hssd_n{N} episodes, goals on this many hubs")
     args = ap.parse_args()
 
     from mas.sim_host.host import SimHost
+
+    if args.hub:
+        for n in args.n:
+            src = json.load(gzip.open(data_path(n)))
+            by_id = {e["info"]["source_episode_id"]: e for e in src["episodes"]}
+            host = SimHost(f"hssd_n{n}")
+            eps = []
+            for eid in args.episode_ids:
+                host.reset(eid)
+                ep = to_hub(host.env, by_id[eid], args.hub, random.Random(f"hub-{args.seed}-{eid}-{n}"))
+                print(f"episode {eid} hub n={n}: {'ok' if ep else 'no goal spot'}", flush=True)
+                if ep:
+                    eps.append(ep)
+            host.env.close()
+            with gzip.open(hub_path(n), "wt") as f:
+                json.dump({**{k: v for k, v in src.items() if k != "episodes"}, "episodes": eps}, f)
+            print(f"hub n={n}: {len(eps)} episodes -> {hub_path(n)}")
+        return
 
     os.makedirs(OUT_DIR, exist_ok=True)
     src = json.load(gzip.open(os.path.join("data", "datasets", "hssd", "rearrange", "val",

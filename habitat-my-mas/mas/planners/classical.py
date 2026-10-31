@@ -20,12 +20,14 @@ cheap tour estimate picks the TOP_ALLOCATIONS most promising assignments first.
 
 import itertools
 import math
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
 from mas.skills.catalog import DOMAIN_FUNCTIONS, DOMAIN_PREDICATES, DOMAIN_TYPES
 from mas.slm.client import SLMClient, parse_json
 
+from . import model_aid
 from .base import Plan, Step
 
 NAV_BASE_STEPS = 20       # fixed cost of a navigate_to (turning, settling)
@@ -40,7 +42,12 @@ def _inner(expr: str) -> str:
     return e[5:-1].strip() if e.startswith("(and ") and e.endswith(")") else e
 
 
-def domain_pddl(robots: List[dict], allocation: bool = True) -> str:
+def _macro_cost_function(m: dict) -> str:
+    types = dict(m["params"])
+    return f"(cost-{m['name']} {' '.join(f'{v} - {types[v]}' for v in m['cost_vars'])}) - number"
+
+
+def domain_pddl(robots: List[dict], allocation: bool = True, macros: Optional[List[dict]] = None) -> str:
     schemas: Dict[str, dict] = {}
     for r in robots:
         for t in r["tools"]:
@@ -56,10 +63,16 @@ def domain_pddl(robots: List[dict], allocation: bool = True) -> str:
             f" (:action {name}\n  :parameters {sc['parameters']}\n"
             f"  :precondition (and {pre})\n"
             f"  :effect (and {_inner(sc['effect'])} (increase (total-cost) {sc.get('cost', '1')})))")
+    for m in macros or []:  # E9: composed by model_aid.compose_macro from the actions above
+        if allocation:
+            m = {**m, "pre": m["pre"] + [p.replace("(can-pick", "(assigned", 1)
+                                         for p in m["pre"] if p.startswith("(can-pick")]}
+        actions.append(model_aid.macro_action_pddl(m))
+    funcs = " ".join(_macro_cost_function(m) for m in macros or [] if m["cost_vars"])
     preds = DOMAIN_PREDICATES + (["(assigned ?r - robot ?o - object)"] if allocation else [])
     return ("(define (domain mas)\n (:requirements :strips :typing :action-costs)\n"
             f" (:types {' '.join(DOMAIN_TYPES)})\n (:predicates {' '.join(preds)})\n"
-            f" (:functions {' '.join(DOMAIN_FUNCTIONS)} (total-cost) - number)\n"
+            f" (:functions {' '.join(DOMAIN_FUNCTIONS)} {funcs} (total-cost) - number)\n"
             + "\n".join(actions) + ")")
 
 
@@ -123,7 +136,7 @@ class _Problem:
     def text(self, allocation: Dict[str, str], goal: Optional[List[str]] = None) -> str:
         costs = [f"(= (nav-cost {r['id']} {a} {b}) {nav_cost(pa, pb)})"
                  for r in self.robots for a, pa in self.loc.items() for b, pb in self.loc.items() if a != b]
-        assigned = [f"(assigned {r} {o})" for o, r in allocation.items()]
+        assigned = [f"(assigned {r} {o})" for o, r in allocation.items()] + getattr(self, "extra_init", [])
         objs = (" ".join(r["id"] for r in self.robots) + " - robot "
                 + " ".join(o["name"] for o in self.objects) + " - object "
                 + " ".join(self.loc) + " - location")
@@ -177,6 +190,7 @@ class ClassicalPlanner:
         from unified_planning.shortcuts import get_environment
         get_environment().credits_stream = None
         self.engine = engine
+        self.expanded = 0  # Fast Downward expanded states, summed over calls (E9 metric)
 
     def _solve(self, domain: str, problem: str) -> Tuple[Optional[list], str]:
         from unified_planning.io import PDDLReader
@@ -184,6 +198,8 @@ class ClassicalPlanner:
         pb = PDDLReader().parse_problem_string(domain, problem)
         with OneshotPlanner(name=self.engine) as planner:
             res = planner.solve(pb)
+        log = "\n".join(m.message for m in (res.log_messages or []))
+        self.expanded += sum(int(x) for x in re.findall(r"Expanded (\d+) state", log)[-1:])
         if res.plan is None:
             return None, res.status.name
         return [(a.action.name, [str(p) for p in a.actual_parameters]) for a in res.plan.actions], res.status.name
@@ -221,10 +237,36 @@ class ClassicalPlanner:
         return per
 
     def plan_for_goal(self, goal: List[str], robots: List[dict], state: dict,
-                      feasibility: Dict[str, Dict[str, dict]]) -> Plan:
+                      feasibility: Dict[str, Dict[str, dict]], aid: Optional[dict] = None) -> Plan:
+        """aid (E9, model_aid.py): {"exclusive": set of receptacles or None, "insert_waits": bool,
+        "landmarks": ["(holding r o)"], "macros": [composed macros]}. None: plain planner."""
         t0 = time.time()
+        self.expanded = 0
+        aid = aid or {}
         out = Plan()
         prob = _Problem(state, feasibility, goal)
+        aid_log = {"landmarks_applied": [], "macros_used": 0, "macro_fallbacks": 0,
+                   "scheduled_waits": 0, "scheduled_conflicts": 0}
+        for lm in aid.get("landmarks", []):  # (holding r o): r must move o
+            _, r, o = lm.strip("()").split()
+            if o in prob.capable:
+                prob.capable[o] = [r] if r in prob.capable[o] else []
+                aid_log["landmarks_applied"].append(lm)
+        prob.infeasible = [o for o, rs in prob.capable.items() if not rs]
+        prob.goal = [g for g in goal if not any(f" {o} " in g + " " for o in prob.infeasible)]
+        macros = {m["name"]: m for m in aid.get("macros", [])}
+        prob.extra_init = []
+        if macros:
+            by_type = {"robot": [r["id"] for r in prob.robots], "location": list(prob.loc),
+                       "object": [o["name"] for o in prob.objects]}
+
+            def cost_fn(term):
+                t = term.strip("()").split()
+                return int(t[0]) if len(t) == 1 else nav_cost(prob.loc[t[2]], prob.loc[t[3]])
+            for m in macros.values():
+                prob.extra_init += model_aid.macro_cost_table(m, by_type, cost_fn)
+        start_place = {o["name"]: o.get("start_receptacle") for o in prob.objects}
+        exclusive = aid.get("exclusive")
         # a goal that names a place with no placement spot (e.g. only a start
         # receptacle) cannot be expressed, let alone achieved
         declared = set(prob.loc) | {r["id"] for r in prob.robots} | {o["name"] for o in prob.objects}
@@ -235,7 +277,9 @@ class ClassicalPlanner:
             out.planner_calls.append({"engine": self.engine, "latency_s": round(time.time() - t0, 3),
                                       "prompt_tokens": 0, "completion_tokens": 0, "goal": prob.goal})
             return out
-        domain = domain_pddl(robots)
+        domain = domain_pddl(robots, macros=list(macros.values()))
+        plain_domain = domain_pddl(robots) if macros else domain
+        schemas = model_aid.schemas_from_tools(robots)
         options = [prob.capable[o] for o in prob.todo if prob.capable[o]]
         todo = [o for o in prob.todo if prob.capable[o]]
         n = 1
@@ -249,16 +293,38 @@ class ClassicalPlanner:
         best, tried = None, []
         for alloc in allocations:
             actions, status = self._solve_allocation(domain, prob, alloc)
+            if actions is not None and macros:
+                used = sum(a[0] in macros for a in actions)
+                actions = model_aid.expand(actions, macros)
+                err = None if not aid.get("replay", True) else model_aid.replay(actions, prob.init + [f"(assigned {r} {o})" for o, r in alloc.items()],
+                                       prob.goal, schemas)
+                if err:  # never execute an unchecked macro plan: plan again without macros
+                    aid_log["macro_fallbacks"] += 1
+                    actions, status = self._solve_allocation(plain_domain, prob, alloc)
+                else:
+                    aid_log["macros_used"] += used
             if actions is None:
                 tried.append({"allocation": alloc, "status": status})
                 continue
             per = self._costs(actions, prob)
-            key = (max(per.values(), default=0), sum(per.values()))
-            tried.append({"allocation": alloc, "status": status, "makespan": key[0], "total": key[1]})
+            by_robot: Dict[str, list] = {}
+            for a in actions:
+                by_robot.setdefault(a[1][0], []).append(a)
+            if exclusive is not None:
+                span, waits, conf = model_aid.schedule(by_robot, prob.loc, start_place, exclusive, nav_cost)
+            else:
+                span, waits, conf = max(per.values(), default=0), {}, 0
+            key = (span, sum(per.values()))
+            tried.append({"allocation": alloc, "status": status, "makespan": key[0], "total": key[1],
+                          "scheduled_conflicts": conf})
             if best is None or key < best[0]:
-                best = (key, alloc, actions)
+                best = (key, alloc, by_robot, waits, conf)
 
+        if best is not None:
+            aid_log["scheduled_waits"] = sum(best[3].values()) if aid.get("insert_waits") else 0
+            aid_log["scheduled_conflicts"] = best[4]
         record = {"engine": self.engine, "latency_s": round(time.time() - t0, 3),
+                  "expanded": self.expanded, "aid": aid_log if aid else None,
                   "prompt_tokens": 0, "completion_tokens": 0, "goal": prob.goal,
                   "infeasible_objects": prob.infeasible, "allocations": tried,
                   "domain": domain, "problem": prob.text(best[1] if best else {})}
@@ -267,21 +333,26 @@ class ClassicalPlanner:
             out.parse_ok = False
             out.errors = [f"no plan found ({len(tried)} allocations tried)"]
             return out
-        out.raw = [f"{n}({', '.join(a)})" for n, a in best[2]]
-        for name, args in best[2]:
-            robot = args[0]
-            if name == "navigate_to":
-                to = args[2]
-                if to.startswith("start_"):
+        out.raw = [f"{n}({', '.join(a)})" for acts in best[2].values() for n, a in acts]
+        waits = best[3] if aid.get("insert_waits") else {}
+        for robot, acts in best[2].items():
+            for i, (name, args) in enumerate(acts):
+                w = waits.get((robot, i), 0)
+                while w > 0:  # scheduled wait before an arm action at an exclusive receptacle
+                    out.steps.setdefault(robot, []).append(Step("wait", {"steps": min(200, w)}))
+                    w -= 200
+                if name == "navigate_to":
+                    to = args[2]
+                    if to.startswith("start_"):
+                        continue
+                    step = Step("navigate_to", {"target": to[3:] if to.startswith("at_") else to})
+                elif name == "pick":
+                    step = Step("pick", {"object": args[1]})
+                elif name == "place":
+                    step = Step("place", {"object": args[1], "place": args[2]})
+                else:
                     continue
-                step = Step("navigate_to", {"target": to[3:] if to.startswith("at_") else to})
-            elif name == "pick":
-                step = Step("pick", {"object": args[1]})
-            elif name == "place":
-                step = Step("place", {"object": args[1], "place": args[2]})
-            else:
-                continue
-            out.steps.setdefault(robot, []).append(step)
+                out.steps.setdefault(robot, []).append(step)
         if prob.infeasible:
             out.errors = [f"no robot can move {o}; goal dropped" for o in prob.infeasible]
         return out
@@ -292,7 +363,25 @@ class ClassicalOnlyPlanner(ClassicalPlanner):
     mode = "classical_only"
 
     def plan(self, instruction: str, robots: List[dict], state: dict, ctx: dict) -> Plan:
-        return self.plan_for_goal(ctx["goal"], robots, state, ctx["feasibility"])
+        return self.plan_for_goal(ctx["goal"], robots, state, ctx["feasibility"], aid=ctx.get("aid"))
+
+    def is_landmark(self, landmark: str, robots: List[dict], state: dict,
+                    feasibility: Dict[str, Dict[str, dict]], goal: List[str]) -> bool:
+        """E9 verification. (holding r o) is a landmark iff the problem without any action that
+        achieves it (every pick(r, o, *) needs (can-pick r o), so that fact is removed) is
+        unsolvable. Checked with satisficing Fast Downward on the unallocated domain."""
+        _, r, o = landmark.strip("()").split()
+        prob = _Problem(state, feasibility, goal)
+        if o not in prob.todo or prob.capable.get(o) == []:
+            return False  # the object does not have to be moved (or cannot be): nothing must hold it
+        prob.init = [f for f in prob.init if f != f"(can-pick {r} {o})"]
+        prob.extra_init = []
+        engine, self.engine = self.engine, "fast-downward"
+        try:
+            actions, _ = self._solve(domain_pddl(robots, allocation=False), prob.text({}))
+        finally:
+            self.engine = engine
+        return actions is None
 
 
 GOAL_SYSTEM = """You translate a household instruction into a formal goal for a planner.

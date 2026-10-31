@@ -33,6 +33,9 @@ REACH_OK = 0.12         # m, IK residual below which a base pose counts as reach
                         #    (a grasp succeeds within GRASP_DIST = 0.15 m)
 APPROACH_DISTS = (0.45, 0.6, 0.75, 0.9)  # m from the target, for alternative base poses
 MAX_ATTEMPTS = 3        # base poses to try before OUT_OF_REACH
+# E9 receptacle occupancy (on only when the host is started with occupancy=True)
+D_MIN = 0.8             # m, base to base: closer than this, two arms at work would collide
+T_MAX = 300             # steps a robot waits for a busy spot before RECEPTACLE_BUSY
 
 
 class SkillFailure(Exception):
@@ -156,6 +159,10 @@ class ArmSkill(SkillRunner):
     def contact_distance(self) -> float:
         return float(np.linalg.norm(self.host.ee_world(self.robot_id) - self.target_world()))
 
+    def receptacle(self) -> Optional[str]:
+        """The receptacle this arm action works at (for occupancy logging)."""
+        return None
+
     # -- planning base poses with the IK model --------------------------------
     def _residual(self, pos, yaw: float) -> float:
         art = self.agent.articulated_agent
@@ -223,7 +230,20 @@ class ArmSkill(SkillRunner):
             # (the base is blocked and jitters in place)
             if abs(err) > TURN_TOL and self.turn_still < 20:
                 return {"name": "base_velocity", "args": {"base_vel": [0.0, float(np.clip(3 * err, -1, 1))]}}
+            self.phase = "wait_spot" if self.host.occupancy else "reach"
+        if self.phase == "wait_spot":
+            blocker = self.host.spot_blocker(self.robot_id, D_MIN)
+            if blocker is not None:
+                self.waited = getattr(self, "waited", 0) + 1
+                self.host.note_wait(self.robot_id, blocker, self.receptacle(), first=self.waited == 1)
+                if self.waited >= T_MAX:
+                    self.host.note_busy_failure()
+                    raise SkillFailure("RECEPTACLE_BUSY",
+                                       f"{self.receptacle()} occupied by {blocker} for {self.waited} steps")
+                return IDLE
             self.phase = "reach"
+        if self.phase in ("reach", "rest") and self.host.occupancy and self.after_rest is None:
+            self.host.claim_spot(self.robot_id, self.receptacle())
         if self.phase == "reach":
             ik = self.host.arm(self.robot_id)
             ee = ik.fk()
@@ -243,6 +263,8 @@ class ArmSkill(SkillRunner):
 
     def after_step(self):
         art = self.agent.articulated_agent
+        if self.phase == "wait_spot":
+            return None
         if self.phase == "drive":
             self.drive_steps += 1
             pos = np.array(art.base_pos)
@@ -289,6 +311,37 @@ class ArmSkill(SkillRunner):
         return None
 
 
+class _ReachProbe(ArmSkill):
+    """ArmSkill's IK pose model aimed at a fixed point, for E9's capacity check."""
+
+    def __init__(self, host, robot_id, target):
+        super().__init__(host, robot_id)
+        self._target = np.asarray(target, dtype=np.float32)
+
+    def target_world(self):
+        return self._target
+
+
+def reach_poses(host: SimHost, robot_id: str, target, dists=(0.45, 0.65, 0.85), n_angles: int = 8,
+                n_yaws: int = 8) -> list:
+    """Floor positions around `target` from which `robot_id`'s arm reaches it (IK residual
+    < REACH_OK), on the robot's navmesh island. Same model the pick/place skill plans with."""
+    probe = _ReachProbe(host, robot_id, target)
+    pf = host.env.sim.pathfinder
+    here = np.array(probe.agent.articulated_agent.base_pos)
+    island = pf.get_island(here)
+    out = []
+    for d in dists:
+        for a in np.linspace(0, 2 * np.pi, n_angles, endpoint=False):
+            p = np.array([target[0] + d * np.cos(a), here[1], target[2] + d * np.sin(a)], dtype=np.float32)
+            snap = np.array(pf.snap_point(p))
+            if np.isnan(snap).any() or np.linalg.norm((snap - p)[[0, 2]]) > 0.15 or pf.get_island(snap) != island:
+                continue
+            if min(probe._residual(snap, y) for y in np.linspace(0, 2 * np.pi, n_yaws, endpoint=False)) < REACH_OK:
+                out.append(snap[[0, 2]])
+    return out
+
+
 class Pick(ArmSkill):
     def __init__(self, host, robot_id, object: str):
         super().__init__(host, robot_id)
@@ -307,6 +360,9 @@ class Pick(ArmSkill):
 
     def target_world(self):
         return np.array(self._obj().translation)
+
+    def receptacle(self):
+        return self.host._obj_place.get(self.object)
 
     def contact(self) -> bool:
         if self.contact_distance() >= GRASP_DIST:
@@ -331,6 +387,9 @@ class Place(ArmSkill):
 
     def target_world(self):
         return self.goal
+
+    def receptacle(self):
+        return self.place
 
     def contact_distance(self) -> float:
         obj = self.host.env.sim.get_rigid_object_manager().get_object_by_handle(self.host._names.handle(self.object))
