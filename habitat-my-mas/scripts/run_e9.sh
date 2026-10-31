@@ -43,6 +43,21 @@ matrix() {  # matrix <episodes>
   done
 }
 
+# Option 1 (findings F30-F31): interference while driving. Pilot gate only, for now:
+#   INTERFERENCE=nav bash scripts/run_e9.sh
+if [ "${INTERFERENCE:-occupancy}" = nav ]; then
+  OUT=results/e9_nav; mkdir -p "$OUT/logs"; cp -rn results/e9/feasibility "$OUT/" 2>/dev/null
+  BENCH=hssd_n8
+  "$HABITAT_PY" -m mas.sim_host.server --benchmark $BENCH --nav-interference --port "$PORT" > "$OUT/logs/sim_host_$BENCH.log" 2>&1 &
+  SIM=$!
+  until grep -q -E "listening|Traceback" "$OUT/logs/sim_host_$BENCH.log" 2>/dev/null; do sleep 1; done
+  PILOT=$(cut -d' ' -f1-10 scripts/e8_episodes.txt)
+  run "$OUT/pilot" "$PILOT" --aid none --interference nav
+  run "$OUT/pilot" "$PILOT" --aid hand --interference nav
+  stop_sim
+  echo "[$(date '+%m-%d %H:%M')] nav pilot done"; exit 0
+fi
+
 # 0. pilot gate: does interference handling written by hand help at all?
 BENCH=hssd_hub_n8; start_sim $BENCH
 PILOT=$(cut -d' ' -f1-10 scripts/e9_hub_n8_episodes.txt)

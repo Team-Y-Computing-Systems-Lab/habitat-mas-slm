@@ -206,6 +206,26 @@ def build_aid(args, sim, planner, robots, state, feas, goal, ep, cache_dir) -> t
     true_excl = {p for p, v in truth["capacity"].items() if v["exclusive"]}
     schemas = ma.schemas_from_tools(robots)
     log = {"mode": args.aid, "true_exclusive": sorted(true_excl)}
+    if args.interference == "nav":
+        locs = {f"start_{r['id']}": r["pos"] for r in state["robots"] if r["active"]}
+        for o in state["objects"]:
+            locs[f"at_{o['name']}"] = o["pos"]
+            if o.get("goal_receptacle") and o.get("goal_pos"):
+                locs.setdefault(o["goal_receptacle"], o["goal_pos"])
+        pm_path = os.path.join(cache_dir, "passages", bench, f"{ep}.json")
+        if os.path.exists(pm_path):
+            pm = json.load(open(pm_path))
+        else:
+            pm = sim.call("passage_map", locations=locs)
+            os.makedirs(os.path.dirname(pm_path), exist_ok=True)
+            json.dump(pm, open(pm_path, "w"))
+        log["passages"] = len(pm["passages"])
+        if args.aid == "none":
+            return {}, log
+        if args.aid == "hand":  # interference handling only: every narrow passage is one-way-at-a-time
+            return {"passages": {"routes": pm["routes"], "exclusive": {p["id"] for p in pm["passages"]}},
+                    "insert_waits": True}, log
+        raise SystemExit("--interference nav: SLM conditions are not built yet (pilot gate first)")
     if args.aid == "none":
         return {}, log
     if args.aid == "hand":
@@ -276,7 +296,7 @@ def make_planner(args):
 def run_tag(args) -> str:
     """Short name of the configuration, used in run ids and the index."""
     extra = ([f"replan{args.replan}"] if args.replan else []) + (["anon"] if args.anonymize else []) \
-        + ([f"aid_{args.aid}"] if args.aid else [])
+        + ([f"aid_{args.aid}"] if args.aid else []) + (["nav"] if args.aid and args.interference == "nav" else [])
     if args.planner == "slm_only":
         return "+".join([args.prompt] + (["norm"] if args.normalize else []) + (["repair"] if args.repair else []) + extra)
     return "+".join([args.engine] + extra)
@@ -490,6 +510,8 @@ def main():
     p.add_argument("--aid", choices=["none", "hand", "slm_raw", "slm_verified", "slm_hint"],
                    help="E9 model additions for the classical planner (A none, B hand, C-E SLM)")
     p.add_argument("--aid-model", default="qwen3:8b", help="E9: SLM that proposes the additions")
+    p.add_argument("--interference", choices=["occupancy", "nav"], default="occupancy",
+                   help="E9: which interference the sim host models (start it with the matching flag)")
     p.add_argument("--e9-cache", default=os.path.join(PROJECT_ROOT, "results", "e9"),
                    help="E9: where capacity checks and SLM proposals are cached")
     p.add_argument("--anonymize", action="store_true",

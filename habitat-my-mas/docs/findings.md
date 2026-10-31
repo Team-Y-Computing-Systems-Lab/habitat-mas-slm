@@ -8,6 +8,42 @@ paths now live under `results/emos_fork_era/`.
 
 ---
 
+## 2026-10-31 · E9 option 1 pilot: interference while driving is rare too (gate failed)
+
+**Setup.** New sim rule: a robot waits while another robot less than 1 m ahead cannot be driven
+around, meaning no navigable floor 0.65 m to either side of it (`--nav-interference`; a robot
+already waiting gives way; failure `NAV_BLOCKED` after 400 steps). Narrow passages come from the
+same test, run on a 0.3 m grid and clustered (`SimHost.passage_map`). Condition B is interference
+handling only: every passage is single-file, and the scheduler inserts waits so two robots are
+never in one passage at the same time. 10 E8 episodes with 8 objects (`results/e9_nav/pilot/`).
+
+| | Success | Sub-goals | Makespan | Waits while driving (steps) | Bases < 0.6 m (steps/episode) |
+|---|---|---|---|---|---|
+| A plain | 50% | 88% | 1728 | 4 (409) | 11 |
+| B known passages + scheduled waits | 40% (0 better, 1 worse) | 93% | 1727 (p = 0.39) | 3 (403) | 9 |
+
+**F33. Robots rarely meet in passages, and when they do it clears in a few steps.** The rule
+works: robots stop driving through each other (base overlap fell from about 70 to about 11 steps
+per episode). But the scheduler found no conflict to avoid in any of the 10 plans. The two
+robots' routes almost never use the same passage at the same time. Apart from one case, each
+wait was under 6 steps.
+
+**F34. The one costly case is a parked robot.** In episode 8 (both conditions), one robot
+finished its plan and stopped inside a passage, and the other waited 400 steps and failed
+(`NAV_BLOCKED`). Scheduling cannot fix this; a rule "never finish inside a passage" in the
+executor can. It is an engineering fix, not something a language model needs to propose.
+
+**Conclusion for E9 (with F30–F32).** With 2 robots in HSSD homes, neither receptacle occupancy
+nor passages cost more than about 1% of execution time. So no knowledge about them, proposed or
+hand-written, can improve plans measurably. Also, any proposal that can be *verified* here can
+be *computed* by code (capacity check, passage map), so a verified SLM proposal can at best match
+the hand-written condition. The SLM conditions C–E were therefore not run. E9 would be worth
+reopening with 3–4 robots in a small, cluttered home or on real robots. The occupancy rule,
+navigation blocking, passage map, scheduler and SLM proposal/verification code are all in place
+for that.
+
+---
+
 ## 2026-10-29 · E9 pilot gate: receptacle occupancy almost never binds (gate failed)
 
 **Setup.** Sim host with the new receptacle-occupancy rule: a robot waits if another robot is

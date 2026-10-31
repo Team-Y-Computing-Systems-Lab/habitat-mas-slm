@@ -65,7 +65,7 @@ def main():
         if base is None:
             continue
         lines += [f"## {bench}", "",
-                  "| Condition | Model | Eps | Success | Sub-goals | Makespan (Δ vs A, p) | Waits / wait steps | "
+                  "| Condition | Model | Eps | Success | Sub-goals | Makespan (Δ vs A, p) | Waits / wait steps (receptacle; drive) | "
                   "Busy fails | Plan s (p) | Expanded | Excl. correct / false / missed | Landmarks true / false | "
                   "Macros used / fallbacks | Tokens in/out |",
                   "|" + "---|" * 14]
@@ -90,8 +90,10 @@ def main():
                 f"| {LABEL[aid]} | {model} | {len(eps)} | {100 * st.mean(r['success'] for r in m):.0f}% "
                 f"({x}/{y}, p={p_s:.2f}) | {100 * st.mean(r['subgoal_rate'] for r in m):.0f}% | "
                 f"{st.mean(span):.0f} ({delta:+.0f}, p={paired_w(span, span_b):.2f}) | "
-                f"{st.mean(i['waits'] for i in itf):.2f} / {st.mean(i['wait_steps'] for i in itf):.0f} | "
-                f"{sum(i['busy_failures'] for i in itf)} | {st.mean(lat):.1f} (p={paired_w(lat, lat_b):.2f}) | "
+                f"{st.mean(i['waits'] for i in itf):.2f} / {st.mean(i['wait_steps'] for i in itf):.0f}; "
+                f"{st.mean(i.get('nav_waits', 0) for i in itf):.2f} / {st.mean(i.get('nav_wait_steps', 0) for i in itf):.0f}"
+                f" (overlap {st.mean(i['overlap_steps'] for i in itf):.0f}) | "
+                f"{sum(i['busy_failures'] + i.get('nav_blocked_failures', 0) for i in itf)} | {st.mean(lat):.1f} (p={paired_w(lat, lat_b):.2f}) | "
                 f"{st.mean(exp):.0f} | "
                 + (f"{cnt('exclusive_correct')} / {cnt('exclusive_false')} / {cnt('exclusive_missed')} | "
                    f"{cnt('landmarks_true')} / {cnt('landmarks_false')} | " if aid.startswith("slm") else "- | - | ")

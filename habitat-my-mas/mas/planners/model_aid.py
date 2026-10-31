@@ -215,17 +215,26 @@ HAND_MACRO = {"name": "carry",
 
 # ------------------------------------------------------------------ scheduler
 
+PASSAGE_MARGIN = 15  # sim steps kept free around a robot's estimated time inside a passage
+
+
 def schedule(steps_by_robot: Dict[str, List[Tuple[str, List[str]]]], loc: Dict[str, list],
-             start_place: Dict[str, str], exclusive: set, nav_cost) -> Tuple[int, Dict[Tuple[str, int], int], int]:
-    """Timeline of each robot's primitive actions with estimated durations; arm actions at an
-    exclusive receptacle never overlap (first come, first served). Returns (makespan,
-    {(robot, action index): wait steps before it}, number of conflicts resolved)."""
+             start_place: Dict[str, str], exclusive: set, nav_cost,
+             routes: Optional[Dict[str, list]] = None, passages: Optional[set] = None
+             ) -> Tuple[int, Dict[Tuple[str, int], int], int]:
+    """Timeline of each robot's primitive actions with estimated durations (first come, first
+    served). Arm actions at an exclusive receptacle never overlap, and no two robots are inside
+    the same exclusive passage at once: routes["a|b"] lists the passages on the path from a to b
+    with the fractions of the drive where it enters and leaves them. A conflict is resolved by
+    waiting before the action. Returns (makespan, {(robot, action index): wait steps}, conflicts)."""
+    routes, passages = routes or {}, passages or set()
     queues = {}
     for r, acts in steps_by_robot.items():
         q = []
         for i, (name, args) in enumerate(acts):
             if name == "navigate_to":
-                q.append((i, nav_cost(loc[args[1]], loc[args[2]]), None))
+                crossed = [(pid, f0, f1) for pid, f0, f1 in routes.get(f"{args[1]}|{args[2]}", []) if pid in passages]
+                q.append((i, nav_cost(loc[args[1]], loc[args[2]]), crossed))
             elif name == "pick":
                 q.append((i, ARM_COST, start_place.get(args[1])))
             elif name == "place":
@@ -241,7 +250,22 @@ def schedule(steps_by_robot: Dict[str, List[Tuple[str, List[str]]]], loc: Dict[s
         r = min((r for r in queues if pos[r] < len(queues[r])), key=lambda x: t[x])
         i, dur, rec = queues[r][pos[r]]
         start = t[r]
-        if rec is not None and rec in exclusive:
+        if isinstance(rec, list):  # a drive: reserve the passages it crosses
+            moved = True
+            while moved:
+                moved = False
+                for pid, f0, f1 in rec:
+                    lo, hi = start + f0 * dur - PASSAGE_MARGIN, start + f1 * dur + PASSAGE_MARGIN
+                    for a, b in busy.get(pid, []):
+                        if lo < b and a < hi:
+                            start, moved = int(b - f0 * dur + PASSAGE_MARGIN) + 1, True
+            if start > t[r]:
+                waits[(r, i)] = start - t[r]
+                conflicts += 1
+            for pid, f0, f1 in rec:
+                busy.setdefault(pid, []).append((start + f0 * dur - PASSAGE_MARGIN, start + f1 * dur + PASSAGE_MARGIN))
+            rec = None
+        elif rec is not None and rec in exclusive:
             moved = True
             while moved:
                 moved = False

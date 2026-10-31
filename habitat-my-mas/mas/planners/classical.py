@@ -310,8 +310,11 @@ class ClassicalPlanner:
             by_robot: Dict[str, list] = {}
             for a in actions:
                 by_robot.setdefault(a[1][0], []).append(a)
-            if exclusive is not None:
-                span, waits, conf = model_aid.schedule(by_robot, prob.loc, start_place, exclusive, nav_cost)
+            pas = aid.get("passages")
+            if exclusive is not None or pas:
+                span, waits, conf = model_aid.schedule(by_robot, prob.loc, start_place, exclusive or set(), nav_cost,
+                                                       routes=(pas or {}).get("routes"),
+                                                       passages=(pas or {}).get("exclusive"))
             else:
                 span, waits, conf = max(per.values(), default=0), {}, 0
             key = (span, sum(per.values()))

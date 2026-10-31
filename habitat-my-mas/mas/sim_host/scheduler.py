@@ -21,7 +21,7 @@ from .skills import SkillFailure, SkillRunner, make_runner
 HOST_METHODS = {"info", "episodes", "reset", "state", "fleet", "robot",
                 "activate", "deactivate", "step", "skills", "facts", "task_goal", "goal_status", "arm_reach", "feasibility",
                 "start_recording", "stop_recording",
-                "interference_stats", "receptacle_info", "receptacle_capacity"}  # E9
+                "interference_stats", "receptacle_info", "receptacle_capacity", "passage_map"}  # E9
 
 
 class _Request:
@@ -70,7 +70,7 @@ class Scheduler:
                 return req.finish(result={rid: name for rid, (_, _, name) in self.active.items()})
             if req.method not in HOST_METHODS:
                 raise SimHostError("UNKNOWN_METHOD", req.method)
-            if req.method in ("step", "reset", "feasibility", "receptacle_capacity") and self.active:
+            if req.method in ("step", "reset", "feasibility", "receptacle_capacity", "passage_map") and self.active:
                 raise SimHostError("SIM_BUSY", f"skills running: {sorted(self.active)}")
             result = getattr(self.host, req.method)(**req.params)
             if req.method == "deactivate":
@@ -103,7 +103,18 @@ class Scheduler:
         self.host.labels[robot_id] = f"{skill}({shown})"
 
     def _step(self):
-        actions = {rid: runner.action() for rid, (runner, _, _) in self.active.items()}
+        actions = {}
+        for rid in list(self.active):
+            runner = self.active[rid][0]
+            try:
+                actions[rid] = runner.action()
+            except SkillFailure as e:  # a skill may also fail while choosing its action
+                self._fail(rid, e.code, str(e))
+            except Exception as e:
+                traceback.print_exc()
+                self._fail(rid, "INTERNAL", repr(e))
+        if not self.active:
+            return
         try:
             self.host.step(actions)
         except SimHostError as e:

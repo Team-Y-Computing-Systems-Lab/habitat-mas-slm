@@ -36,6 +36,7 @@ MAX_ATTEMPTS = 3        # base poses to try before OUT_OF_REACH
 # E9 receptacle occupancy (on only when the host is started with occupancy=True)
 D_MIN = 0.8             # m, base to base: closer than this, two arms at work would collide
 T_MAX = 300             # steps a robot waits for a busy spot before RECEPTACLE_BUSY
+NAV_WAIT_MAX = 400      # steps a robot waits for another one blocking a passage before NAV_BLOCKED
 
 
 class SkillFailure(Exception):
@@ -46,6 +47,22 @@ class SkillFailure(Exception):
 
 class SkillRunner:
     max_steps = 200
+    nav_waited = 0
+    nav_waiting = False
+
+    def nav_yield(self) -> bool:
+        """E9 option 1: wait (True) while another robot ahead cannot be driven around."""
+        self.nav_waiting = False
+        if not self.host.nav_interference:
+            return False
+        blocker = self.host.nav_blocker(self.robot_id)
+        if blocker is None:
+            return False
+        self.nav_waited += 1
+        self.nav_waiting = True
+        self.nav_blocker_id = blocker
+        self.host.note_nav_wait(self.robot_id, blocker, first=self.nav_waited == 1)
+        return True
 
     def __init__(self, host: SimHost, robot_id: str):
         self.host = host
@@ -78,6 +95,9 @@ class SkillRunner:
 
     def tick(self) -> Optional[dict]:
         self.steps += 1
+        if self.nav_waited >= NAV_WAIT_MAX:  # raised here: the scheduler handles failures from tick()
+            self.host.note_nav_blocked_failure()
+            raise SkillFailure("NAV_BLOCKED", f"{self.nav_blocker_id} blocked the way for {self.nav_waited} steps")
         result = self.after_step()
         if result is None and self.steps >= self.max_steps:
             raise SkillFailure("TIMEOUT", f"not done after {self.steps} steps")
@@ -94,6 +114,8 @@ class NavigateTo(SkillRunner):
         self._last_pos, self._still, self._moved = None, 0, False
 
     def action(self):
+        if self.nav_yield():
+            return IDLE
         return {"name": "oracle_nav_action", "args": {"oracle_nav_action": [self.entity + 1]}}
 
     def after_step(self):
@@ -105,6 +127,8 @@ class NavigateTo(SkillRunner):
         # keeps turning in place and never reports done
         # (the initial turn-on-the-spot is not a stall: count only after moving)
         pos = np.array(self.agent.articulated_agent.base_pos)
+        if self.nav_waiting:  # standing still on purpose is not a stall
+            return None
         if self._last_pos is None:
             self._last_pos = pos
         elif np.linalg.norm((pos - self._last_pos)[[0, 2]]) < 0.01:
@@ -221,6 +245,8 @@ class ArmSkill(SkillRunner):
             self.poses = self._plan_poses()
             self._next_pose()
         if self.phase == "drive":
+            if self.nav_yield():
+                return IDLE
             return {"name": "oracle_nav_coord_action",
                     "args": {"oracle_nav_coord_action": list(map(float, self.drive_to)),
                              "oracle_nav_lookat_action": list(map(float, self.target_world())), "mode": [0]}}
@@ -266,6 +292,8 @@ class ArmSkill(SkillRunner):
         if self.phase == "wait_spot":
             return None
         if self.phase == "drive":
+            if self.nav_waiting:
+                return None
             self.drive_steps += 1
             pos = np.array(art.base_pos)
             moved = self._drive_prev is None or np.linalg.norm((pos - self._drive_prev)[[0, 2]]) > 0.005

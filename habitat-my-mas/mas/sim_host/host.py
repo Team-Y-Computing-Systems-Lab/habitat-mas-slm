@@ -13,6 +13,7 @@ Activating a robot moves it back onto the navmesh.
 
 from typing import Any, Dict, List, Optional
 
+import magnum as mn
 import numpy as np
 
 import habitat
@@ -56,7 +57,8 @@ def _jsonable(x: Any) -> Any:
 
 
 class SimHost:
-    def __init__(self, benchmark: str, overrides: Optional[List[str]] = None, occupancy: bool = False):
+    def __init__(self, benchmark: str, overrides: Optional[List[str]] = None, occupancy: bool = False,
+                 nav_interference: bool = False):
         if benchmark not in BENCHMARKS:
             raise SimHostError("UNKNOWN_BENCHMARK", f"choose from {sorted(BENCHMARKS)}")
         self.benchmark = benchmark
@@ -89,6 +91,9 @@ class SimHost:
         self._rest_q: Dict[str, np.ndarray] = {}   # arm pose after reset
         # E9 receptacle occupancy (skills.py ArmSkill): a robot at work claims its base spot
         self.occupancy = occupancy
+        # E9 option 1: a robot that cannot get around another one ahead of it waits (skills.py)
+        self.nav_interference = nav_interference
+        self._yield: Dict[str, tuple] = {}          # robot -> (robot it waits for, step)
         self._claims: Dict[str, tuple] = {}         # robot -> (base xz, receptacle, step)
         self._interference = self._new_interference()
 
@@ -117,6 +122,7 @@ class SimHost:
         self.labels = {}
         self._index_episode()
         self._claims = {}
+        self._yield = {}
         self._interference = self._new_interference()
         for r in self.robots:
             art = self._agent(r["id"]).articulated_agent
@@ -580,7 +586,8 @@ class SimHost:
 
     @staticmethod
     def _new_interference() -> Dict[str, Any]:
-        return {"waits": 0, "wait_steps": 0, "busy_failures": 0, "overlap_steps": 0, "conflicts": []}
+        return {"waits": 0, "wait_steps": 0, "busy_failures": 0, "overlap_steps": 0, "conflicts": [],
+                "nav_waits": 0, "nav_wait_steps": 0, "nav_blocked_failures": 0, "nav_conflicts": []}
 
     def _base_xz(self, robot_id: str) -> np.ndarray:
         return np.array(self._agent(robot_id).articulated_agent.base_pos)[[0, 2]]
@@ -606,6 +613,130 @@ class SimHost:
             st["conflicts"].append({"robot": robot_id, "blocked_by": blocker, "receptacle": receptacle,
                                     "blocker_receptacle": self._claims.get(blocker, (None, None))[1],
                                     "step": self._step_count})
+
+    def _navigable(self, p, island: int, tol: float = 0.12) -> bool:
+        pf = self.env.sim.pathfinder
+        snap = np.array(pf.snap_point(np.asarray(p, dtype=np.float32)))
+        return (not np.isnan(snap).any() and float(np.linalg.norm((snap - p)[[0, 2]])) < tol
+                and pf.get_island(snap) == island)
+
+    def can_pass(self, pos, direction, side: float = 0.65) -> bool:
+        """Is there navigable floor `side` m to the left or right of `pos` (across `direction`),
+        so a robot heading that way could go around something standing at `pos`?"""
+        pf = self.env.sim.pathfinder
+        pos = np.asarray(pos, dtype=np.float32)
+        island = pf.get_island(np.array(pf.snap_point(pos)))
+        d = np.array([direction[0], 0.0, direction[1]], dtype=np.float32)
+        d /= max(float(np.linalg.norm(d)), 1e-6)
+        n = np.array([-d[2], 0.0, d[0]], dtype=np.float32)
+        return self._navigable(pos + side * n, island) or self._navigable(pos - side * n, island)
+
+    def nav_blocker(self, robot_id: str, lookahead: float = 1.0, cone_deg: float = 60.0) -> Optional[str]:
+        """Another robot less than `lookahead` m ahead that this robot cannot get around (no
+        floor beside it). A robot that is already waiting for this one does not block it."""
+        art = self._agent(robot_id).articulated_agent
+        me = np.array(art.base_pos)
+        f3 = np.array(art.base_transformation.transform_vector(mn.Vector3(1.0, 0.0, 0.0)))  # base +x is forward
+        fwd = f3[[0, 2]] / max(float(np.linalg.norm(f3[[0, 2]])), 1e-6)
+        for r in self.robots:
+            other = r["id"]
+            if other == robot_id or not self._active.get(other):
+                continue
+            them = np.array(self._agent(other).articulated_agent.base_pos)
+            v = (them - me)[[0, 2]]
+            d = float(np.linalg.norm(v))
+            if d >= lookahead or d < 1e-3:
+                continue
+            if np.degrees(np.arccos(np.clip(np.dot(v / d, fwd), -1, 1))) > cone_deg:
+                continue
+            waiting_for, step = self._yield.get(other, (None, -10))
+            if waiting_for == robot_id and step >= self._step_count - 1:
+                continue
+            if not self.can_pass(them, v):
+                return other
+        return None
+
+    def note_nav_wait(self, robot_id: str, blocker: str, first: bool) -> None:
+        st = self._interference
+        st["nav_wait_steps"] += 1
+        self._yield[robot_id] = (blocker, self._step_count)
+        if first:
+            st["nav_waits"] += 1
+            st["nav_conflicts"].append({"robot": robot_id, "blocked_by": blocker, "step": self._step_count,
+                                        "pos": _jsonable(self._base_xz(robot_id))})
+
+    def note_nav_blocked_failure(self) -> None:
+        self._interference["nav_blocked_failures"] += 1
+
+    def passage_map(self, locations: Dict[str, List[float]], cell: float = 0.3,
+                    link: float = 0.45, min_cells: int = 3) -> Dict[str, Any]:
+        """E9 option 1 ground truth. Narrow passages: navmesh cells where, for some heading, a
+        robot could not get around another one standing there (can_pass false), clustered.
+        routes["a|b"]: passages the shortest path from a to b crosses, as
+        [passage id, fraction of the path where it enters, where it leaves]."""
+        import habitat_sim
+        pf = self.env.sim.pathfinder
+        lo, hi = (np.array(b) for b in pf.get_bounds())
+        y = float(np.median([np.array(self._agent(r["id"]).articulated_agent.base_pos)[1] for r in self.robots]))
+        island = pf.get_island(np.array(self._agent(self.robots[0]["id"]).articulated_agent.base_pos))
+        narrow = []
+        for x in np.arange(lo[0], hi[0], cell):
+            for z in np.arange(lo[2], hi[2], cell):
+                p = np.array([x, y, z], dtype=np.float32)
+                if not self._navigable(p, island, tol=0.05):
+                    continue
+                # corridor-like: blocked for at least two of four headings (a corner blocks one)
+                if sum(not self.can_pass(p, (np.cos(a), np.sin(a))) for a in np.radians([0, 45, 90, 135])) >= 2:
+                    narrow.append(p[[0, 2]])
+        # single-link clusters
+        label = [-1] * len(narrow)
+        k = 0
+        for i in range(len(narrow)):
+            if label[i] >= 0:
+                continue
+            label[i], stack = k, [i]
+            while stack:
+                j = stack.pop()
+                for m in range(len(narrow)):
+                    if label[m] < 0 and np.linalg.norm(narrow[m] - narrow[j]) <= link:
+                        label[m] = k
+                        stack.append(m)
+            k += 1
+        cells = np.array(narrow) if narrow else np.zeros((0, 2))
+        sizes = {c: int((np.array(label) == c).sum()) for c in range(k)}
+        keep = {c for c, n in sizes.items() if n >= min_cells}
+        passages = [{"id": f"passage_{c}", "centre": _jsonable(cells[np.array(label) == c].mean(0)),
+                     "cells": sizes[c]} for c in sorted(keep)]
+        routes = {}
+        names = list(locations)
+        for a in names:
+            for b in names:
+                if a == b:
+                    continue
+                path = habitat_sim.ShortestPath()
+                path.requested_start = np.array(locations[a], dtype=np.float32)
+                path.requested_end = np.array(locations[b], dtype=np.float32)
+                if not pf.find_path(path) or len(path.points) < 2:
+                    continue
+                pts = [np.array(q)[[0, 2]] for q in path.points]
+                dense, along = [], []
+                total = sum(float(np.linalg.norm(pts[i + 1] - pts[i])) for i in range(len(pts) - 1)) or 1.0
+                run = 0.0
+                for i in range(len(pts) - 1):
+                    seg = float(np.linalg.norm(pts[i + 1] - pts[i]))
+                    for t in np.arange(0, seg, 0.2):
+                        dense.append(pts[i] + (pts[i + 1] - pts[i]) * (t / max(seg, 1e-6)))
+                        along.append((run + t) / total)
+                    run += seg
+                hits: Dict[int, List[float]] = {}
+                if len(cells):
+                    for q, f in zip(dense, along):
+                        dist = np.linalg.norm(cells - q, axis=1)
+                        m = int(np.argmin(dist))
+                        if dist[m] < cell and label[m] in keep:
+                            hits.setdefault(label[m], []).append(f)
+                routes[f"{a}|{b}"] = [[f"passage_{c}", min(fs), max(fs)] for c, fs in hits.items()]
+        return {"passages": passages, "routes": routes}
 
     def note_busy_failure(self) -> None:
         self._interference["busy_failures"] += 1
@@ -667,7 +798,7 @@ class SimHost:
         return out
 
     def interference_stats(self) -> Dict[str, Any]:
-        return {**self._interference, "occupancy": self.occupancy}
+        return {**self._interference, "occupancy": self.occupancy, "nav_interference": self.nav_interference}
 
     # ---------------------------------------------------------------- recording
 

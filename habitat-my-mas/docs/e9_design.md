@@ -1,6 +1,6 @@
 # E9 design: the SLM improves the planner's model instead of replacing it
 
-Status: **implemented; pilot gate failed (2026-10-29), full run not started** (findings F30–F32). Decisions: both episode sets, the scheduler, 2 robots. Changes made while implementing are in §9. Related work: [related_work.md](related_work.md#e9).
+Status: **implemented; both pilot gates failed (receptacles 2026-10-29, passages 2026-10-31); SLM conditions not run** (findings F30–F34). Decisions: both episode sets, the scheduler, 2 robots. Changes made while implementing are in §9. Related work: [related_work.md](related_work.md#e9).
 
 ## 0. Two facts that shape the design
 
