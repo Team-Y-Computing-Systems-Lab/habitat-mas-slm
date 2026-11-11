@@ -137,6 +137,7 @@ def score(goal: List[str], final: dict, plan: Plan, trace: List[dict]) -> dict:
         "prompt_tokens": sum(c.get("prompt_tokens", 0) for c in slm_calls),
         "completion_tokens": sum(c.get("completion_tokens", 0) for c in slm_calls),
         "planning_latency_s": round(sum(c.get("latency_s", 0) for c in slm_calls), 2),
+        "energy_J": final.get("energy", {}).get("total_J", 0.0),
     }
 
 
@@ -169,6 +170,8 @@ def summarize(records: List[dict]) -> dict:
             "avg_wait_steps": round(sum(r["metrics"]["interference"]["wait_steps"] for r in records) / n, 1),
             "avg_overlap_steps": round(sum(r["metrics"]["interference"]["overlap_steps"] for r in records) / n, 1)}
            if all("interference" in r["metrics"] for r in records) else {}),
+        **({"avg_energy_J": avg("energy_J"), "total_energy_J": round(sum(r["metrics"]["energy_J"] for r in records), 1)}
+           if all("energy_J" in r["metrics"] for r in records) else {}),
     }
 
 

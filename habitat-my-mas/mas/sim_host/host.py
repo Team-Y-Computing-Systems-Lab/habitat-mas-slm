@@ -22,6 +22,7 @@ from habitat.config.default import get_config
 from mas.skills.catalog import skills_for
 
 from .benchmarks import BENCHMARKS, OVERRIDES, ROBOT_PREFIX
+from .energy import EnergyLedger
 from .ik import UrdfArmIK
 from .naming import NameTable
 
@@ -96,6 +97,7 @@ class SimHost:
         self._yield: Dict[str, tuple] = {}          # robot -> (robot it waits for, step)
         self._claims: Dict[str, tuple] = {}         # robot -> (base xz, receptacle, step)
         self._interference = self._new_interference()
+        self._energy = EnergyLedger(self.robots)
 
     # ------------------------------------------------------------------ episodes
 
@@ -119,6 +121,7 @@ class SimHost:
         self._clear_action_caches()
         self._names = NameTable()
         self._step_count = 0
+        self._energy.zero()
         self.labels = {}
         self._index_episode()
         self._claims = {}
@@ -546,6 +549,7 @@ class SimHost:
             "goal": self.task_goal(),
             "goal_status": self.goal_status(),
             "metrics": _jsonable(self.env.get_metrics()),
+            "energy": self._energy.report(),
         }
 
     # --------------------------------------------------------------------- step
@@ -576,6 +580,8 @@ class SimHost:
             raise SimHostError("EPISODE_OVER", "call reset first")
         self._last_obs = self.env.step({"action": tuple(names), "action_args": args})
         self._step_count += 1
+        active = {r["id"] for r in self.robots if self._active.get(r["id"])}
+        self._energy.accumulate(active, set(actions) & active)
         self._count_overlap()
         if self._recorder is not None:
             self._recorder.capture(self._step_count)
