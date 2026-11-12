@@ -44,7 +44,8 @@ def run_report(run_dir: str) -> str:
     kpis = [("success", summary.get("success_rate")), ("sub-goals", summary.get("subgoal_rate")),
             ("valid plans", summary.get("plan_valid_rate")), ("sim steps", summary.get("avg_sim_steps")),
             ("tokens in/out", f"{summary.get('avg_prompt_tokens')}/{summary.get('avg_completion_tokens')}"),
-            ("plan latency s", summary.get("avg_planning_latency_s"))]
+            ("plan latency s", summary.get("avg_planning_latency_s")),
+            ("energy J", summary.get("avg_energy_J"))]
     out = [f"<!doctype html><meta charset=utf-8><title>{_e(config['run_id'])}</title><style>{CSS}</style>",
            f"<h1>{_e(config['planner'])} · {_e(config.get('config', config.get('prompt', 'base')))} · {_e(config.get('model') or 'no SLM')}</h1>",
            f"<div class=muted>{_e(config['benchmark'])} · {len(records)} episodes · fleet "
@@ -93,7 +94,8 @@ def index_report(results_dir: str) -> str:
     if os.path.exists(index):
         rows = list(csv.DictReader(open(index)))
     cols = ["benchmark", "planner", "config", "model", "repeat", "episodes", "success_rate", "subgoal_rate", "plan_valid_rate",
-            "avg_sim_steps", "avg_prompt_tokens", "avg_completion_tokens", "avg_planning_latency_s"]
+            "avg_sim_steps", "avg_prompt_tokens", "avg_completion_tokens",
+            "avg_planning_latency_s", "avg_energy_J"]
     body = "".join(
         "<tr>" + "".join(f"<td class={'num' if c not in ('benchmark', 'planner', 'config', 'model') else ''}>{_e(r.get(c, ''))}</td>"
                          for c in cols)
